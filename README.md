@@ -6,16 +6,24 @@ Testing the **synchronization tax prediction**: can the Shannon/Kolmogorov "wall
 
 [Misra (2025)](https://medium.com/@vishalmisra/the-wall-between-shannon-and-kolmogorov-65a9d7e8fb7c) gave a clean demonstration of the phenomenon: when a transformer is trained on modular linear recurrences (`x_{t+1} = ax_t + b mod 17`) with cross-entropy loss computed only at positions 1-K, the model achieves near-Bayesian performance at trained positions but fails catastrophically at untrained positions. Misra interprets this "wall" as an intrinsic boundary: LLMs compile localized prediction circuits based on pattern matching (Shannon) rather than learning generalized, position-independent algorithms (Kolmogorov).
 
-Initially, this repository sought to test an alternative interpretation based on the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/#the-three-part-decomposition) framework. We hypothesized that the wall might not be an intrinsic limit of the architecture, but rather an artifact of where training allocates resources (the "synchronization tax"). 
+This repository tests an alternative interpretation based on the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/#the-three-part-decomposition) framework, which predicted that the wall reflects where training allocates resources rather than an architectural ceiling.
 
 **The Original Prediction:**
-> If the wall simply reflects where synchronization costs are paid, providing a generic "maintenance subsidy" (indirect, non-task-specific gradient flow) to unrewarded positions should erode it. 
+
+> If the wall simply reflects where synchronization costs are paid, providing a generic "maintenance subsidy" (indirect, non-task-specific gradient flow) to unrewarded positions should erode it.
 
 **The Findings:**
-This repository implements that test, and **the results strongly validate Misra's original Shannon/Kolmogorov divide.** The control experiments demonstrate that generic gradient flow is completely insufficient to erode the wall (although entropy regularization still suggests the barrier may be thinner than the Shannon/Kolmogorov framing implies). The transformer only succeeds at unrewarded positions when explicit, *task-relevant* supervision (distillation from a teacher) is provided at those specific coordinates. 
+
+The original prediction was too strong. Generic gradient flow — providing compute without task-relevant information — does not erode the wall. Matched controls confirm this cleanly: entropy regularization toward a uniform target, distillation from a random teacher, and hidden-state smoothness constraints all preserve the wall. Misra is right that generic compute is not enough.
+
+But the wall is not as thick as the Shannon/Kolmogorov framing implies. Two mechanisms eliminate it completely:
+
+- **Distillation** from a trained teacher erodes the wall by supplying the full Bayesian posterior at unrewarded positions. This supports Misra's interpretation: the teacher hands the student the answer.
+- **Entropy regularization** erodes the wall by supplying only a scalar signal — *how uncertain to be* — without specifying *what to predict*. The model reconstructs the full posterior from its own internal representations given only this calibration hint. This is harder to reconcile with a hard Shannon/Kolmogorov divide, since the circuit capable of Bayesian inference already exists in the trained weights and needs only minimal supervisory signal to activate at new positions.
 
 **Conclusion:**
-In the language of the *Maintaining Divergence* framework, this experiment proves that the "synchronization tax" for algorithmic execution cannot be paid with generic compute. Because the model has not learned a universal Kolmogorov program, it requires the teacher to supply the missing informational beliefs at every novel position. The wall is indeed an intrinsic limit of how standard autoregressive transformers generalize.
+
+The experiment disciplines the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/) framework: the "synchronization tax" cannot be paid with generic compute. Information content, not gradient flow, determines where circuits generalize. But the entropy regularization result suggests the wall may be a calibration barrier rather than a compilation barrier — the model possesses the circuit but cannot deploy it without a minimal task-relevant signal. Whether this distinction matters for practical LLM limitations remains an open question.
 
 ## Results
 
