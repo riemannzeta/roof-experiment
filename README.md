@@ -4,13 +4,18 @@ Testing the **synchronization tax prediction**: can the Shannon/Kolmogorov "wall
 
 ## Background
 
-[Misra (2025)](https://medium.com/@vishalmisra/the-wall-between-shannon-and-kolmogorov-65a9d7e8fb7c) demonstrated a striking phenomenon: when a transformer is trained on modular linear recurrences (`x_{t+1} = ax_t + b mod 17`) with cross-entropy loss computed only at positions 1-K, the model achieves near-Bayesian performance at trained positions but fails catastrophically at untrained positions. Misra interprets this "wall" as an intrinsic boundary between Shannon identification and Kolmogorov construction.
+[Misra (2025)](https://medium.com/@vishalmisra/the-wall-between-shannon-and-kolmogorov-65a9d7e8fb7c) gave a clean demonstration of the phenomenon: when a transformer is trained on modular linear recurrences (`x_{t+1} = ax_t + b mod 17`) with cross-entropy loss computed only at positions 1-K, the model achieves near-Bayesian performance at trained positions but fails catastrophically at untrained positions. Misra interprets this "wall" as an intrinsic boundary: LLMs compile localized prediction circuits based on pattern matching (Shannon) rather than learning generalized, position-independent algorithms (Kolmogorov).
 
-The [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/#the-three-part-decomposition) framework offers an alternative interpretation: the wall is not intrinsic to gradient descent but reflects *where synchronization costs are paid*. This yields a testable prediction:
+Initially, this repository sought to test an alternative interpretation based on the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/#the-three-part-decomposition) framework. We hypothesized that the wall might not be an intrinsic limit of the architecture, but rather an artifact of where training allocates resources (the "synchronization tax"). 
 
-> Any mechanism that provides even indirect gradient flow to unrewarded positions should erode the wall. If the wall reflects an intrinsic limit, no such mechanism should work. If the synchronization tax framing is right, the wall should soften in proportion to the maintenance subsidy.
+**The Original Prediction:**
+> If the wall simply reflects where synchronization costs are paid, providing a generic "maintenance subsidy" (indirect, non-task-specific gradient flow) to unrewarded positions should erode it. 
 
-This repo implements and tests that prediction.
+**The Findings:**
+This repository implements that test, and **the results strongly validate Misra's original Shannon/Kolmogorov divide.** The control experiments demonstrate that generic gradient flow is completely insufficient to erode the wall. The transformer only succeeds at unrewarded positions when explicit, *task-relevant* supervision (distillation from a teacher) is provided at those specific coordinates. 
+
+**Conclusion:**
+In the language of the *Maintaining Divergence* framework, this experiment proves that the "synchronization tax" for algorithmic execution cannot be paid with generic compute. Because the model has not learned a universal Kolmogorov program, it requires the teacher to supply the missing informational beliefs at every novel position. The wall is indeed an intrinsic limit of how standard autoregressive transformers generalize.
 
 ## Results
 
