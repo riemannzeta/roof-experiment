@@ -507,6 +507,178 @@ def plot_causal_full_horizon(results, output_dir):
 
 
 # ============================================================================
+# Experiment 3 plots: Endogenous Roof
+# ============================================================================
+
+ENDOGENOUS_COLORS = {
+    'none': '#888888',
+    'temperature': '#E91E63',
+    'gate': '#2196F3',
+    'both': '#9C27B0',
+}
+
+ENDOGENOUS_LABELS = {
+    'none': 'Baseline (no mechanism)',
+    'temperature': 'Learned Temperature',
+    'gate': 'Positional Forget-Gate',
+    'both': 'Temperature + Gate',
+}
+
+
+def plot_endogenous_mae(results, output_dir, loss_horizon=5):
+    """Figure 7: Per-position MAE for endogenous roof mechanisms."""
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+    for endo_type in ['none', 'temperature', 'gate', 'both']:
+        matching = [r for r in results
+                    if r.get('endogenous') == endo_type]
+        if not matching:
+            continue
+
+        positions, maes = _get_per_pos_arrays(matching)
+        color = ENDOGENOUS_COLORS[endo_type]
+        ax.plot(positions, maes, color=color, linewidth=2,
+                label=ENDOGENOUS_LABELS[endo_type], alpha=0.9)
+
+    ax.axvline(x=loss_horizon + 0.5, color='red', linestyle=':',
+               alpha=0.5, label='Loss horizon')
+    ax.set_xlabel('Position t', fontsize=12)
+    ax.set_ylabel('MAE (bits)', fontsize=12)
+    ax.set_title('Endogenous Roof: Per-Position MAE', fontsize=14)
+    ax.legend(fontsize=10)
+    ax.set_ylim(bottom=-0.05)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, 'endogenous_mae.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+
+def plot_endogenous_temperature(results, output_dir, loss_horizon=5):
+    """Figure 8: Learned temperature per position.
+
+    The key diagnostic: does the model learn a position-independent
+    temperature, or does it spike at untrained positions?
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+    for endo_type in ['temperature', 'both']:
+        matching = [r for r in results
+                    if r.get('endogenous') == endo_type
+                    and 'endogenous_diagnostics' in r
+                    and 'temperature_per_position' in r.get(
+                        'endogenous_diagnostics', {})]
+        if not matching:
+            continue
+
+        # Average temperature across seeds
+        all_temps = {}
+        for r in matching:
+            tpp = r['endogenous_diagnostics']['temperature_per_position']
+            for t_str, val in tpp.items():
+                t = int(t_str)
+                if t not in all_temps:
+                    all_temps[t] = []
+                all_temps[t].append(val)
+
+        positions = sorted(all_temps.keys())
+        temps = [np.mean(all_temps[t]) for t in positions]
+
+        color = ENDOGENOUS_COLORS[endo_type]
+        ax.plot(positions, temps, color=color, linewidth=2,
+                label=ENDOGENOUS_LABELS[endo_type], marker='o',
+                markersize=4, alpha=0.9)
+
+    ax.axvline(x=loss_horizon + 0.5, color='red', linestyle=':',
+               alpha=0.5, label='Loss horizon')
+    ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3,
+               label='T=1 (no scaling)')
+    ax.set_xlabel('Position t', fontsize=12)
+    ax.set_ylabel('Learned Temperature', fontsize=12)
+    ax.set_title('Endogenous Roof: Learned Temperature per Position',
+                 fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, 'endogenous_temperature.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+
+def plot_endogenous_gate(results, output_dir, loss_horizon=5):
+    """Figure 9: Gate values per position per layer.
+
+    The key diagnostic: do gates at untrained positions go to 0
+    (suppressing positional noise)?
+    """
+    # Find a result with gate data
+    gate_results = [r for r in results
+                    if r.get('endogenous') in ('gate', 'both')
+                    and 'endogenous_diagnostics' in r
+                    and 'gate_per_layer_position' in r.get(
+                        'endogenous_diagnostics', {})]
+    if not gate_results:
+        print("No gate data found, skipping gate plot")
+        return
+
+    # Use first matching result for layer structure
+    glp = gate_results[0]['endogenous_diagnostics']['gate_per_layer_position']
+    n_layers_found = len(glp)
+
+    # Plot a selection of layers
+    layers_to_plot = [0, n_layers_found // 2, n_layers_found - 1]
+    layers_to_plot = sorted(set(l for l in layers_to_plot
+                                if str(l) in glp))
+
+    fig, axes = plt.subplots(1, len(layers_to_plot),
+                              figsize=(5 * len(layers_to_plot), 5),
+                              sharey=True)
+    if len(layers_to_plot) == 1:
+        axes = [axes]
+
+    for ax_idx, layer_idx in enumerate(layers_to_plot):
+        ax = axes[ax_idx]
+
+        # Average across matching results
+        all_gates = {}
+        for r in gate_results:
+            glp_r = r['endogenous_diagnostics']['gate_per_layer_position']
+            layer_data = glp_r.get(str(layer_idx), {})
+            for t_str, val in layer_data.items():
+                t = int(t_str)
+                if t not in all_gates:
+                    all_gates[t] = []
+                all_gates[t].append(val)
+
+        positions = sorted(all_gates.keys())
+        gates = [np.mean(all_gates[t]) for t in positions]
+
+        color = ENDOGENOUS_COLORS['gate']
+        ax.plot(positions, gates, color=color, linewidth=2,
+                marker='o', markersize=4, alpha=0.9)
+        ax.axvline(x=loss_horizon + 0.5, color='red', linestyle=':',
+                   alpha=0.5)
+        ax.set_title(f'Layer {layer_idx}', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Position t', fontsize=11)
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, alpha=0.3)
+
+    axes[0].set_ylabel('Mean Gate Value (0=ignore pos, 1=use pos)',
+                        fontsize=11)
+    fig.suptitle('Endogenous Roof: Positional Gate Values',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    path = os.path.join(output_dir, 'endogenous_gate.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {path}")
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -514,7 +686,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Plot roof experiment results')
     parser.add_argument('--experiment',
-                        choices=['distill_direction', 'causal_direction'],
+                        choices=['distill_direction', 'causal_direction',
+                                 'endogenous_roof'],
                         required=True)
     parser.add_argument('--results', type=str, required=True,
                         help='Path to summary JSON file')
@@ -534,6 +707,10 @@ def main():
         plot_causal_4panel(results, args.output)
         plot_causal_mae_comparison(results, args.output)
         plot_causal_full_horizon(results, args.output)
+    elif args.experiment == 'endogenous_roof':
+        plot_endogenous_mae(results, args.output)
+        plot_endogenous_temperature(results, args.output)
+        plot_endogenous_gate(results, args.output)
 
 
 if __name__ == '__main__':

@@ -1,9 +1,8 @@
 """
-Roof Experiment — Testing KL Asymmetry as the Mechanism of Causal Transfer
-============================================================================
+Roof Experiment — Testing KL Asymmetry and Endogenous Maintenance
+==================================================================
 
-Two experiments testing the Maintaining Divergence framework's claim that
-KL divergence direction determines whether causal structure transfers:
+Three experiments testing the Maintaining Divergence framework:
 
 Experiment 1 — Distillation Direction:
   Forward KL (mode-covering), Reverse KL (mode-seeking), and Jensen-Shannon
@@ -16,24 +15,26 @@ Experiment 2 — Non-Invertible Generating Process:
   backward prediction. Tests whether the statistical asymmetry created by
   genuine causation is detectable only in the causal direction.
 
-Usage:
-    # Experiment 1: single distillation condition
-    python roof_experiment.py --experiment distill_direction \
-        --distill_direction reverse --subsidy_lambda 0.5 \
-        --teacher_checkpoint results/wall_erosion/teacher_seed42/best_model.pt \
-        --seeds 42 --device mps
+Experiment 3 — Endogenous Roof:
+  Learned temperature scaling and attention positional forget-gate. Tests
+  whether the model can learn to pay its own synchronization tax — maintaining
+  the causal circuit's calibration without external subsidy.
 
+Usage:
     # Experiment 1: full matrix
     python roof_experiment.py --experiment distill_direction --run_matrix \
         --seeds 42 43 44 --device mps
 
-    # Experiment 2: single causal direction condition
-    python roof_experiment.py --experiment causal_direction \
-        --generator quadratic --prediction_direction forward \
-        --seeds 42 --device mps
-
     # Experiment 2: full matrix
     python roof_experiment.py --experiment causal_direction --run_matrix \
+        --seeds 42 43 44 --device mps
+
+    # Experiment 3: single endogenous condition
+    python roof_experiment.py --experiment endogenous_roof \
+        --endogenous temperature --seeds 42 --device mps
+
+    # Experiment 3: full matrix
+    python roof_experiment.py --experiment endogenous_roof --run_matrix \
         --seeds 42 43 44 --device mps
 """
 
@@ -79,6 +80,311 @@ def _sync_torch():
     torch = _torch
     nn = _nn
     F = _F
+
+
+# ============================================================================
+# Endogenous roof model
+# ============================================================================
+
+def _build_endogenous_model_class(endogenous_type='none'):
+    """Build a model with optional endogenous roof mechanisms.
+
+    Args:
+        endogenous_type: 'none', 'temperature', 'gate', or 'both'
+
+    The model wraps RecurrenceTransformerSubsidy and adds:
+    - Temperature head: MLP that outputs per-position temperature scalar,
+      applied to final logits. The model learns when to sharpen/soften.
+    - Positional forget-gate: separates content and positional streams in
+      Q/K with a learned sigmoid gate that can suppress positional info.
+    """
+    _ensure_torch()
+    _sync_torch()
+
+    use_temp = endogenous_type in ('temperature', 'both')
+    use_gate = endogenous_type in ('gate', 'both')
+
+    class TemperatureHead(nn.Module):
+        """Learned per-position temperature scaling."""
+        def __init__(self, d_model):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(d_model, d_model // 4),
+                nn.GELU(),
+                nn.Linear(d_model // 4, 1),
+                nn.Softplus(),  # T > 0
+            )
+            # Initialize to output ~1.0 (no-op temperature)
+            with torch.no_grad():
+                self.net[-2].bias.fill_(0.55)  # softplus(0.55) ≈ 1.0
+
+        def forward(self, hiddens):
+            return self.net(hiddens).squeeze(-1)  # (B, T)
+
+    class GatedMultiHeadAttention(nn.Module):
+        """Attention with positional forget-gate.
+
+        Separates content and positional streams in Q/K projections.
+        A learned sigmoid gate controls how much positional information
+        enters the attention computation. gate=0 means pure content
+        attention (position-blind); gate=1 means full positional info.
+        """
+        def __init__(self, d_model, n_heads, dropout=0.1):
+            super().__init__()
+            self.n_heads = n_heads
+            self.d_head = d_model // n_heads
+
+            # Content QKV (applied to token embeddings only)
+            self.qkv = nn.Linear(d_model, 3 * d_model)
+            self.out_proj = nn.Linear(d_model, d_model)
+            self.dropout = nn.Dropout(dropout)
+
+            # Positional gate: per-head sigmoid from content features
+            self.pos_gate_proj = nn.Sequential(
+                nn.Linear(d_model, n_heads),
+                nn.Sigmoid(),
+            )
+            # Initialize gate bias high (~0.8) so the model starts
+            # with mostly-on positional information
+            with torch.no_grad():
+                self.pos_gate_proj[0].bias.fill_(1.4)  # sigmoid(1.4) ≈ 0.8
+
+        def forward(self, x, pos_embed, mask=None):
+            """Forward with gated positional embedding.
+
+            Args:
+                x: (B, T, d_model) — token embeddings + (gated) pos embeddings
+                pos_embed: (B, T, d_model) — raw positional embeddings
+                mask: causal mask
+            Returns:
+                output: (B, T, d_model)
+                alpha: (B, n_heads, T, T) attention weights
+                gate_values: (B, T, n_heads) gate activations for diagnostics
+            """
+            B, T, C = x.shape
+
+            # Compute gate from the input (which already has some pos info)
+            gate = self.pos_gate_proj(x)  # (B, T, n_heads)
+
+            # Compute QKV from content
+            qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_head)
+            q, k, v = qkv.unbind(dim=2)
+
+            # Compute positional QK contribution
+            qkv_pos = self.qkv(pos_embed).reshape(
+                B, T, 3, self.n_heads, self.d_head)
+            q_pos, k_pos, _ = qkv_pos.unbind(dim=2)
+
+            # Gate the positional contribution: (B, T, n_heads, 1)
+            gate_expanded = gate.unsqueeze(-1)  # (B, T, n_heads, 1)
+            q = q + gate_expanded * q_pos
+            k = k + gate_expanded * k_pos
+
+            q = q.transpose(1, 2)  # (B, n_heads, T, d_head)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            scale = self.d_head ** -0.5
+            attn = (q @ k.transpose(-2, -1)) * scale
+            if mask is not None:
+                attn = attn.masked_fill(
+                    mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            alpha = torch.softmax(attn, dim=-1)
+            alpha = self.dropout(alpha)
+            out = (alpha @ v).transpose(1, 2).reshape(B, T, C)
+
+            return self.out_proj(out), alpha, gate
+
+    class GatedTransformerBlock(nn.Module):
+        """Transformer block with optional positional forget-gate."""
+        def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1):
+            super().__init__()
+            d_ff = d_ff or 4 * d_model
+            self.attn = GatedMultiHeadAttention(d_model, n_heads, dropout)
+            self.ln1 = nn.LayerNorm(d_model)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout),
+            )
+
+        def forward(self, x, pos_embed, mask=None):
+            h, alpha, gate = self.attn(self.ln1(x), pos_embed, mask)
+            x = x + h
+            x = x + self.ff(self.ln2(x))
+            return x, alpha, gate
+
+    class RecurrenceTransformerEndogenous(nn.Module):
+        """Transformer with endogenous roof mechanisms.
+
+        Supports:
+        - Temperature head: learned per-position temperature for logit scaling
+        - Positional forget-gate: learned per-head gate on positional info
+        - Both simultaneously
+        """
+        def __init__(self, vocab_size, n_tokens, d_model=192, n_layers=6,
+                     n_heads=6, d_ff=768, dropout=0.1):
+            super().__init__()
+            self.vocab_size = vocab_size
+            self.n_tokens = n_tokens
+            self.d_model = d_model
+            self.use_temp = use_temp
+            self.use_gate = use_gate
+
+            self.token_embed = nn.Embedding(
+                vocab_size + 1, d_model, padding_idx=vocab_size)
+            self.pos_embed = nn.Embedding(512, d_model)
+
+            if use_gate:
+                self.layers = nn.ModuleList([
+                    GatedTransformerBlock(d_model, n_heads, d_ff, dropout)
+                    for _ in range(n_layers)
+                ])
+            else:
+                # Use standard blocks from wall_erosion_experiment
+                from wall_erosion_experiment import _build_model_class
+                # We need the TransformerBlock class — rebuild it
+                _base = _build_model_class()
+                # Actually, just inline standard attention
+                self.layers = nn.ModuleList([
+                    self._make_standard_block(d_model, n_heads, d_ff, dropout)
+                    for _ in range(n_layers)
+                ])
+
+            self.ln_final = nn.LayerNorm(d_model)
+            self.output_proj = nn.Linear(d_model, n_tokens)
+
+            # Temperature head
+            self.temp_head = None
+            if use_temp:
+                self.temp_head = TemperatureHead(d_model)
+
+        def _make_standard_block(self, d_model, n_heads, d_ff, dropout):
+            """Build a standard transformer block (no gate)."""
+
+            class _StdMultiHeadAttention(nn.Module):
+                def __init__(self_inner):
+                    super().__init__()
+                    self_inner.n_heads = n_heads
+                    self_inner.d_head = d_model // n_heads
+                    self_inner.qkv = nn.Linear(d_model, 3 * d_model)
+                    self_inner.out_proj = nn.Linear(d_model, d_model)
+                    self_inner.dropout_layer = nn.Dropout(dropout)
+
+                def forward(self_inner, x, mask=None):
+                    B, T, C = x.shape
+                    qkv = self_inner.qkv(x).reshape(
+                        B, T, 3, self_inner.n_heads, self_inner.d_head)
+                    q, k, v = qkv.unbind(dim=2)
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
+                    scale = self_inner.d_head ** -0.5
+                    attn = (q @ k.transpose(-2, -1)) * scale
+                    if mask is not None:
+                        attn = attn.masked_fill(
+                            mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+                    alpha = torch.softmax(attn, dim=-1)
+                    alpha = self_inner.dropout_layer(alpha)
+                    out = (alpha @ v).transpose(1, 2).reshape(B, T, C)
+                    return self_inner.out_proj(out), alpha
+
+            class _StdBlock(nn.Module):
+                def __init__(self_inner):
+                    super().__init__()
+                    self_inner.attn = _StdMultiHeadAttention()
+                    self_inner.ln1 = nn.LayerNorm(d_model)
+                    self_inner.ln2 = nn.LayerNorm(d_model)
+                    self_inner.ff = nn.Sequential(
+                        nn.Linear(d_model, d_ff),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(d_ff, d_model),
+                        nn.Dropout(dropout),
+                    )
+
+                def forward(self_inner, x, mask=None):
+                    h, alpha = self_inner.attn(self_inner.ln1(x), mask)
+                    x = x + h
+                    x = x + self_inner.ff(self_inner.ln2(x))
+                    return x, alpha
+
+            return _StdBlock()
+
+        def forward(self, tokens):
+            """Standard forward — returns logits (compatible with eval)."""
+            B, T = tokens.shape
+            mask = torch.triu(
+                torch.ones(T, T, device=tokens.device), diagonal=1
+            ).bool()
+
+            tok_emb = self.token_embed(tokens)
+            positions = torch.arange(
+                T, device=tokens.device).unsqueeze(0).expand(B, -1)
+            pos_emb = self.pos_embed(positions)
+            x = tok_emb + pos_emb
+
+            if self.use_gate:
+                for layer in self.layers:
+                    x, _, _ = layer(x, pos_emb, mask)
+            else:
+                for layer in self.layers:
+                    x, _ = layer(x, mask)
+
+            hiddens = self.ln_final(x)
+            logits = self.output_proj(hiddens)
+
+            if self.use_temp and self.temp_head is not None:
+                temp = self.temp_head(hiddens)  # (B, T)
+                temp = temp.unsqueeze(-1)  # (B, T, 1)
+                logits = logits / temp.clamp(min=0.01)
+
+            return logits
+
+        def forward_with_diagnostics(self, tokens):
+            """Returns (logits, diagnostics_dict).
+
+            diagnostics_dict contains:
+              'temperature': (B, T) learned temperature (if use_temp)
+              'gate_values': list of (B, T, n_heads) per layer (if use_gate)
+            """
+            B, T = tokens.shape
+            mask = torch.triu(
+                torch.ones(T, T, device=tokens.device), diagonal=1
+            ).bool()
+
+            tok_emb = self.token_embed(tokens)
+            positions = torch.arange(
+                T, device=tokens.device).unsqueeze(0).expand(B, -1)
+            pos_emb = self.pos_embed(positions)
+            x = tok_emb + pos_emb
+
+            all_gates = []
+            if self.use_gate:
+                for layer in self.layers:
+                    x, _, gate = layer(x, pos_emb, mask)
+                    all_gates.append(gate.detach())
+            else:
+                for layer in self.layers:
+                    x, _ = layer(x, mask)
+
+            hiddens = self.ln_final(x)
+            logits = self.output_proj(hiddens)
+
+            diag = {}
+            if self.use_temp and self.temp_head is not None:
+                temp = self.temp_head(hiddens)  # (B, T)
+                diag['temperature'] = temp.detach()
+                logits = logits / temp.unsqueeze(-1).clamp(min=0.01)
+            if self.use_gate:
+                diag['gate_values'] = all_gates
+
+            return logits, diag
+
+    return RecurrenceTransformerEndogenous
 
 
 # ============================================================================
@@ -349,7 +655,6 @@ def train_roof(args):
     """
     _ensure_torch()
     _sync_torch()
-    RecurrenceTransformerSubsidy = _build_model_class()
 
     device = _resolve_device(args.device)
     p = args.p
@@ -358,16 +663,33 @@ def train_roof(args):
     loss_horizon = args.loss_horizon
     train_seq_len = args.train_seq_len
 
-    model = RecurrenceTransformerSubsidy(
-        vocab_size=vocab_size,
-        n_tokens=n_tokens,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        d_ff=args.d_ff,
-        dropout=args.dropout,
-        aux_classifier=False,
-    ).to(device)
+    endogenous_type = getattr(args, 'endogenous', 'none')
+    is_endogenous = (args.experiment == 'endogenous_roof'
+                     and endogenous_type != 'none')
+
+    if is_endogenous:
+        EndogenousModel = _build_endogenous_model_class(endogenous_type)
+        model = EndogenousModel(
+            vocab_size=vocab_size,
+            n_tokens=n_tokens,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            d_ff=args.d_ff,
+            dropout=args.dropout,
+        ).to(device)
+    else:
+        RecurrenceTransformerSubsidy = _build_model_class()
+        model = RecurrenceTransformerSubsidy(
+            vocab_size=vocab_size,
+            n_tokens=n_tokens,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            d_ff=args.d_ff,
+            dropout=args.dropout,
+            aux_classifier=False,
+        ).to(device)
 
     param_count = sum(pr.numel() for pr in model.parameters())
     print(f"Model: {param_count:,} parameters on {device}")
@@ -376,6 +698,8 @@ def train_roof(args):
     if args.experiment == 'distill_direction':
         print(f"Distillation: {args.distill_direction}, "
               f"lambda={args.subsidy_lambda}")
+    if is_endogenous:
+        print(f"Endogenous mechanism: {endogenous_type}")
     print(f"Loss horizon: 1-{loss_horizon} (of {train_seq_len})")
 
     # Load teacher for distillation experiment
@@ -505,6 +829,29 @@ def train_roof(args):
                       f"DKL={pp['dkl_mean']:.4f} "
                       f"MC={pp['mode_conc_model_mean']:.3f}{marker}")
 
+            # Log endogenous diagnostics
+            if is_endogenous and hasattr(model, 'forward_with_diagnostics'):
+                with torch.no_grad():
+                    sample_x, _, _ = generate_batch_extended(
+                        p, args.pi, train_seq_len, 32, device,
+                        generator=args.generator,
+                        direction=args.prediction_direction)
+                    _, diag = model.forward_with_diagnostics(sample_x)
+                    if 'temperature' in diag:
+                        temp = diag['temperature'].mean(dim=0)  # (T,)
+                        temp_str = " ".join(
+                            f"{temp[t].item():.2f}" for t in range(
+                                min(train_seq_len, len(temp))))
+                        print(f"    Temp: [{temp_str}]")
+                    if 'gate_values' in diag:
+                        # Mean gate across batch and heads for last layer
+                        last_gate = diag['gate_values'][-1].mean(
+                            dim=(0, 2))  # (T,)
+                        gate_str = " ".join(
+                            f"{last_gate[t].item():.2f}" for t in range(
+                                min(train_seq_len, len(last_gate))))
+                        print(f"    Gate (last layer): [{gate_str}]")
+
             if metrics['mae_bits'] < best_mae:
                 best_mae = metrics['mae_bits']
                 torch.save(
@@ -553,6 +900,38 @@ def train_roof(args):
     print(f"  Wall Ratio: {wm['wall_ratio']:.2f}x")
     print(f"  Erosion Fraction: {ef:.4f}")
 
+    # Endogenous diagnostics for final results
+    endogenous_diag = {}
+    if is_endogenous and hasattr(model, 'forward_with_diagnostics'):
+        with torch.no_grad():
+            sample_x, _, _ = generate_batch_extended(
+                p, args.pi, train_seq_len, 200, device,
+                generator=args.generator,
+                direction=args.prediction_direction)
+            _, diag = model.forward_with_diagnostics(sample_x)
+            if 'temperature' in diag:
+                temp = diag['temperature'].mean(dim=0).cpu().tolist()
+                endogenous_diag['temperature_per_position'] = {
+                    str(t): temp[t] for t in range(len(temp))}
+                print(f"\n  Learned temperature per position:")
+                for t in range(len(temp)):
+                    marker = " [T]" if t < loss_horizon else " [U]"
+                    print(f"    t={t:2d}: T={temp[t]:.4f}{marker}")
+            if 'gate_values' in diag:
+                # Per-layer, per-position mean gate (across batch and heads)
+                gate_per_layer = {}
+                for layer_idx, gv in enumerate(diag['gate_values']):
+                    g = gv.mean(dim=(0, 2)).cpu().tolist()  # (T,)
+                    gate_per_layer[str(layer_idx)] = {
+                        str(t): g[t] for t in range(len(g))}
+                endogenous_diag['gate_per_layer_position'] = gate_per_layer
+                # Print last layer
+                last = diag['gate_values'][-1].mean(dim=(0, 2)).cpu()
+                print(f"\n  Gate values (last layer) per position:")
+                for t in range(len(last)):
+                    marker = " [T]" if t < loss_horizon else " [U]"
+                    print(f"    t={t:2d}: gate={last[t]:.4f}{marker}")
+
     results = {
         'experiment': args.experiment,
         'generator': args.generator,
@@ -560,12 +939,14 @@ def train_roof(args):
         'distill_direction': getattr(args, 'distill_direction', None),
         'control': getattr(args, 'control', False),
         'subsidy_lambda': getattr(args, 'subsidy_lambda', 0.0),
+        'endogenous': endogenous_type,
         'loss_horizon': loss_horizon,
         'train_seq_len': train_seq_len,
         'metrics': metrics,
         'per_position': {str(k): v for k, v in per_pos.items()},
         'wall_metrics': wm,
         'erosion_fraction': ef,
+        'endogenous_diagnostics': endogenous_diag,
     }
 
     results_path = os.path.join(args.output_dir, 'roof_results.json')
@@ -710,6 +1091,54 @@ def run_causal_direction_matrix(args):
     _print_summary_table(all_results)
 
 
+def run_endogenous_matrix(args):
+    """Run Experiment 3: all endogenous mechanisms x seeds."""
+    base_output = args.output_dir
+    all_results = []
+
+    conditions = [
+        # (endogenous_type,)
+        ('none',),         # baseline (no endogenous mechanism)
+        ('temperature',),  # learned temperature head
+        ('gate',),         # positional forget-gate
+        ('both',),         # temperature + gate combined
+    ]
+
+    for seed in args.seeds:
+        print(f"\n{'#'*70}")
+        print(f"# SEED {seed}")
+        print(f"{'#'*70}")
+
+        for (endo_type,) in conditions:
+            cond_name = f"endogenous_{endo_type}_seed{seed}"
+            cond_dir = os.path.join(base_output, cond_name)
+
+            print(f"\n{'='*70}")
+            print(f"CONDITION: {cond_name}")
+            print(f"{'='*70}")
+
+            _seed_all(seed)
+
+            cond_args = argparse.Namespace(**vars(args))
+            cond_args.endogenous = endo_type
+            cond_args.subsidy_lambda = 0.0
+            cond_args.control = False
+            cond_args.output_dir = cond_dir
+
+            result = train_roof(cond_args)
+            result['condition'] = cond_name
+            result['seed'] = seed
+            all_results.append(result)
+
+    # Save summary
+    summary_path = os.path.join(base_output, 'endogenous_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(all_results, f, indent=2, default=float)
+    print(f"\nSummary saved to {summary_path}")
+
+    _print_summary_table(all_results)
+
+
 def _print_summary_table(all_results):
     """Print a summary table of results."""
     print(f"\n{'='*90}")
@@ -736,7 +1165,8 @@ def main():
 
     # Experiment selection
     parser.add_argument('--experiment',
-                        choices=['distill_direction', 'causal_direction'],
+                        choices=['distill_direction', 'causal_direction',
+                                 'endogenous_roof'],
                         required=True,
                         help='Which experiment to run')
     parser.add_argument('--run_matrix', action='store_true',
@@ -753,6 +1183,12 @@ def main():
                         help='Use random teacher (control)')
     parser.add_argument('--teacher_checkpoint', type=str, default=None,
                         help='Path to teacher model checkpoint')
+
+    # Experiment 3: endogenous roof
+    parser.add_argument('--endogenous',
+                        choices=['none', 'temperature', 'gate', 'both'],
+                        default='none',
+                        help='Endogenous roof mechanism')
 
     # Experiment 2: causal direction
     parser.add_argument('--generator',
@@ -795,6 +1231,8 @@ def main():
             run_distill_direction_matrix(args)
         elif args.experiment == 'causal_direction':
             run_causal_direction_matrix(args)
+        elif args.experiment == 'endogenous_roof':
+            run_endogenous_matrix(args)
         return
 
     # Single condition
