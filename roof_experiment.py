@@ -450,10 +450,37 @@ def compute_js_distill(student_logits, teacher_logits, unrewarded_mask,
 # Per-position calibration metrics
 # ============================================================================
 
+def _generate_one_eval_sample(args_tuple):
+    """Generate one evaluation sample (for multiprocessing)."""
+    p, pi, seq_len, generator, direction = args_tuple
+
+    if generator == 'linear':
+        cfg = RecurrenceConfig(p=p, pi=pi, seq_len=seq_len)
+        if direction == 'forward':
+            tokens, gt, metadata = generate_recurrence_sequence(cfg)
+        else:
+            tokens_fwd, gt_fwd, metadata = generate_recurrence_sequence(cfg)
+            tokens = list(reversed(tokens_fwd))
+            gt = []
+            for t in range(seq_len):
+                prefix = tokens[:t]
+                pred_dist = bayesian_predictive_linear_backward(prefix, p, pi)
+                H = _predictive_entropy(pred_dist)
+                gt.append({
+                    't': t, 'entropy': H, 'pred_dist': pred_dist,
+                })
+    else:  # quadratic
+        cfg = QuadraticConfig(p=p, pi=pi, seq_len=seq_len)
+        tokens, gt, metadata = generate_quadratic_sequence(
+            cfg, direction=direction)
+
+    return tokens, gt
+
+
 def evaluate_with_calibration(model, p, pi, seq_len, n_eval=2000,
                                device='cpu', generator='linear',
                                direction='forward'):
-    """Evaluate model with full calibration metrics.
+    """Evaluate model with full calibration metrics (batched).
 
     Beyond standard MAE, computes:
     - D_KL(P_bayes || P_model) at each position
@@ -465,53 +492,48 @@ def evaluate_with_calibration(model, p, pi, seq_len, n_eval=2000,
     """
     _ensure_torch()
     _sync_torch()
+    from multiprocessing import Pool
 
     model.eval()
+    eval_batch_size = 64
+
+    # --- Phase 1: generate all samples (CPU, parallel) ---
+    gen_args = [(p, pi, seq_len, generator, direction)] * n_eval
+    try:
+        with Pool(4) as pool:
+            samples = pool.map(_generate_one_eval_sample, gen_args)
+    except Exception:
+        # Fallback to sequential if multiprocessing fails
+        samples = [_generate_one_eval_sample(a) for a in gen_args]
+
+    all_tokens = [s[0] for s in samples]
+    all_gt = [s[1] for s in samples]
+
+    # --- Phase 2: batched model inference ---
+    all_probs = []
+    for batch_start in range(0, n_eval, eval_batch_size):
+        batch_end = min(batch_start + eval_batch_size, n_eval)
+        batch_tokens = all_tokens[batch_start:batch_end]
+        tokens_tensor = torch.tensor(batch_tokens, dtype=torch.long).to(device)
+        with torch.no_grad():
+            logits = model(tokens_tensor)
+        probs = F.softmax(logits[:, :, :p], dim=-1).cpu().numpy()
+        all_probs.append(probs)
+
+    all_probs = np.concatenate(all_probs, axis=0)  # (n_eval, seq_len, p)
+
+    # --- Phase 3: compute metrics (vectorized where possible) ---
     per_position = {}
 
     for i in range(n_eval):
-        # Generate sequence and ground truth
-        if generator == 'linear':
-            cfg = RecurrenceConfig(p=p, pi=pi, seq_len=seq_len)
-            if direction == 'forward':
-                tokens, gt, metadata = generate_recurrence_sequence(cfg)
-            else:
-                # Reverse the sequence for backward linear prediction
-                tokens_fwd, gt_fwd, metadata = generate_recurrence_sequence(cfg)
-                tokens = list(reversed(tokens_fwd))
-                # Recompute ground truth for reversed sequence
-                gt = []
-                for t in range(seq_len):
-                    prefix = tokens[:t]
-                    pred_dist = bayesian_predictive_linear_backward(
-                        prefix, p, pi)
-                    H = _predictive_entropy(pred_dist)
-                    from recurrence_bwt import class_posterior_recurrence
-                    w = class_posterior_recurrence(prefix, p, pi)
-                    gt.append({
-                        't': t,
-                        'entropy': H,
-                        'pred_dist': pred_dist,
-                        'p_program': w,
-                    })
-        else:  # quadratic
-            cfg = QuadraticConfig(p=p, pi=pi, seq_len=seq_len)
-            tokens, gt, metadata = generate_quadratic_sequence(
-                cfg, direction=direction)
-
-        # Model forward pass
-        tokens_tensor = torch.tensor([tokens], dtype=torch.long).to(device)
-        with torch.no_grad():
-            logits = model(tokens_tensor)
-
-        probs_model = F.softmax(logits[0, :, :p], dim=-1).cpu().numpy()
+        gt = all_gt[i]
+        probs_model = all_probs[i]  # (seq_len, p)
 
         for entry in gt:
             t = entry['t']
             if t < 1 or t >= seq_len:
                 continue
 
-            # Model predicts token at position t from logits at position t-1
             model_pos = t - 1
             if model_pos >= probs_model.shape[0]:
                 continue
@@ -519,11 +541,9 @@ def evaluate_with_calibration(model, p, pi, seq_len, n_eval=2000,
             model_dist = probs_model[model_pos]
             bayes_dist = entry['pred_dist']
 
-            # Entropy
-            H_model = -sum(
-                model_dist[v] * np.log2(max(model_dist[v], 1e-10))
-                for v in range(p)
-            )
+            # Entropy (vectorized)
+            md_clamped = np.maximum(model_dist, 1e-10)
+            H_model = float(-np.sum(model_dist * np.log2(md_clamped)))
             H_bayes = entry['entropy']
 
             # MAE
@@ -533,12 +553,11 @@ def evaluate_with_calibration(model, p, pi, seq_len, n_eval=2000,
             dkl = 0.0
             for v in range(p):
                 pb = bayes_dist.get(v, 0.0)
-                pm = max(float(model_dist[v]), 1e-10)
                 if pb > 0:
-                    dkl += pb * math.log2(pb / pm)
+                    dkl += pb * math.log2(pb / md_clamped[v])
 
-            # Mode concentration (max probability)
-            mode_conc_model = float(max(model_dist))
+            # Mode concentration
+            mode_conc_model = float(np.max(model_dist))
             mode_conc_bayes = max(bayes_dist.values())
 
             if t not in per_position:
@@ -581,9 +600,56 @@ def evaluate_with_calibration(model, p, pi, seq_len, n_eval=2000,
 # Batch generation for quadratic/backward sequences
 # ============================================================================
 
+def _generate_one_training_sample(args_tuple):
+    """Generate one training sample (for multiprocessing)."""
+    p, pi, seq_len, generator, direction = args_tuple
+
+    if generator == 'linear':
+        cfg = RecurrenceConfig(p=p, pi=pi, seq_len=seq_len)
+        if direction == 'forward':
+            tokens, gt, metadata = generate_recurrence_sequence(cfg)
+        else:
+            tokens_fwd, gt_fwd, meta = generate_recurrence_sequence(cfg)
+            tokens = list(reversed(tokens_fwd))
+            gt = []
+            for t in range(seq_len):
+                prefix = tokens[:t]
+                pred_dist = bayesian_predictive_linear_backward(prefix, p, pi)
+                H = _predictive_entropy(pred_dist)
+                gt.append({'t': t, 'entropy': H})
+            metadata = meta
+    else:  # quadratic
+        cfg = QuadraticConfig(p=p, pi=pi, seq_len=seq_len)
+        tokens, gt, metadata = generate_quadratic_sequence(
+            cfg, direction=direction)
+
+    entropies = [0.0] * seq_len
+    for entry in gt:
+        t = entry['t']
+        if 0 <= t < seq_len:
+            entropies[t] = entry['entropy']
+
+    is_prog = 1.0 if metadata['true_class'] == 'program' else 0.0
+    return tokens, entropies, is_prog
+
+
+# Persistent worker pool (created on first use)
+_worker_pool = None
+
+
+def _get_worker_pool():
+    global _worker_pool
+    if _worker_pool is None:
+        from multiprocessing import Pool
+        _worker_pool = Pool(4)
+    return _worker_pool
+
+
 def generate_batch_extended(p, pi, seq_len, batch_size, device,
                             generator='linear', direction='forward'):
     """Generate batch of sequences, supporting quadratic and backward modes.
+
+    Uses a persistent multiprocessing pool for parallel data generation.
 
     Returns:
         x: (B, seq_len) long tensor of tokens
@@ -593,43 +659,17 @@ def generate_batch_extended(p, pi, seq_len, batch_size, device,
     _ensure_torch()
     _sync_torch()
 
-    all_tokens = []
-    all_entropies = []
-    all_is_program = []
+    gen_args = [(p, pi, seq_len, generator, direction)] * batch_size
 
-    for _ in range(batch_size):
-        if generator == 'linear':
-            cfg = RecurrenceConfig(p=p, pi=pi, seq_len=seq_len)
-            if direction == 'forward':
-                tokens, gt, metadata = generate_recurrence_sequence(cfg)
-            else:
-                tokens_fwd, gt_fwd, meta = generate_recurrence_sequence(cfg)
-                tokens = list(reversed(tokens_fwd))
-                # Recompute gt for reversed sequence
-                gt = []
-                for t in range(seq_len):
-                    prefix = tokens[:t]
-                    pred_dist = bayesian_predictive_linear_backward(
-                        prefix, p, pi)
-                    H = _predictive_entropy(pred_dist)
-                    gt.append({'t': t, 'entropy': H})
-                metadata = meta
-        else:  # quadratic
-            cfg = QuadraticConfig(p=p, pi=pi, seq_len=seq_len)
-            tokens, gt, metadata = generate_quadratic_sequence(
-                cfg, direction=direction)
+    try:
+        pool = _get_worker_pool()
+        results = pool.map(_generate_one_training_sample, gen_args)
+    except Exception:
+        results = [_generate_one_training_sample(a) for a in gen_args]
 
-        all_tokens.append(tokens)
-
-        entropies = [0.0] * seq_len
-        for entry in gt:
-            t = entry['t']
-            if 0 <= t < seq_len:
-                entropies[t] = entry['entropy']
-        all_entropies.append(entropies)
-
-        all_is_program.append(
-            1.0 if metadata['true_class'] == 'program' else 0.0)
+    all_tokens = [r[0] for r in results]
+    all_entropies = [r[1] for r in results]
+    all_is_program = [r[2] for r in results]
 
     x = torch.tensor(all_tokens, dtype=torch.long).to(device)
     entropy_targets = torch.tensor(
@@ -811,7 +851,7 @@ def train_roof(args):
         if step % args.eval_every == 0:
             metrics, per_pos = evaluate_with_calibration(
                 model, p, args.pi, train_seq_len,
-                n_eval=500, device=str(device),
+                n_eval=200, device=str(device),
                 generator=args.generator,
                 direction=args.prediction_direction,
             )
