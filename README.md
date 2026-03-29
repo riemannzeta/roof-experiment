@@ -1,99 +1,102 @@
-# Wall Erosion Experiment
+# Roof Experiment
 
-Testing the **synchronization tax prediction**: can the Shannon/Kolmogorov "wall" be eroded by providing indirect gradient flow to unrewarded positions?
+Follow-up to the [wall-erosion experiment](https://github.com/riemannzeta/wall-erosion-experiment), testing whether KL divergence direction and causal asymmetry in the data-generating process determine how causal structure transfers in transformers.
 
 ## Background
 
-[Misra](https://medium.com/@vishalmisra/the-wall-between-shannon-and-kolmogorov-65a9d7e8fb7c) provides a clean demonstration of a fundamental generalization failure: when a transformer is trained on modular linear recurrences (`x_{t+1} = ax_t + b mod 17`) with cross-entropy loss computed only at positions 1-K, the model achieves near-Bayesian precision at trained positions but fails catastrophically at untrained positions. Misra interprets this "wall" as an intrinsic epistemological boundary: LLMs compile localized prediction circuits based on pattern matching (Shannon) rather than learning generalized, position-independent algorithms (Kolmogorov).
+The wall-erosion experiment established that Misra's Shannon/Kolmogorov "wall" is a **calibration barrier**, not a compilation barrier. The transformer globally compiles the modular recurrence rule, but its confidence collapses at out-of-distribution positions. Two mechanisms erode the wall completely: distillation from a trained teacher (forward KL) and entropy regularization (a scalar calibration signal).
 
-This repository tests an alternative interpretation based on the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/#the-three-part-decomposition) framework. This thermodynamic view of inference predicts that the wall reflects where training allocates resources—a failure to pay the "synchronization tax" required to maintain coherence out-of-distribution—rather than a strict architectural inability to learn the algorithm.
+This repository tests three follow-up questions:
 
-**The Original Prediction:**
-
-> If the wall simply reflects where synchronization costs are paid, providing a generic "maintenance subsidy" (indirect, non-task-specific gradient flow) to unrewarded positions should provide the continuous computational energy needed to maintain coherence and erode the wall.
-
-**The Findings:**
-
-The experimental data disciplines both frameworks productively. The original prediction was too strong, but the strict Shannon/Kolmogorov framing is too rigid.
-
-The original prediction fails because generic gradient flow — providing compute without task-relevant information — does not erode the wall. Matched controls confirm this cleanly: entropy regularization toward a uniform target, distillation from a random teacher, and hidden-state smoothness constraints all preserve the wall. Misra is right that generic compute is not enough; you cannot pay a synchronization tax with unconstrained kinetic energy.
-
-But the wall is not as thick as the Shannon/Kolmogorov framing implies. Two mechanisms eliminate it completely:
-
-- **Distillation** from a trained teacher erodes the wall by supplying the full Bayesian posterior at unrewarded positions. This supports Misra's interpretation: the teacher explicitly hands the student the missing mathematical beliefs.
-- **Entropy regularization** erodes the wall by supplying only a single, label-agnostic scalar signal — *how uncertain to be* — without specifying *what to predict*. Given only this minimal calibration hint, the model flawlessly reconstructs the highly complex Bayesian posterior from its own internal representations. This mathematically challenges a hard Shannon/Kolmogorov divide. If the model were purely a Shannon curve-fitter that never learned the algorithm, forcing it to "be confident" out-of-distribution would simply amplify hallucinated garbage. The fact that it snaps to the exact correct answer proves the generalized Kolmogorov circuit *is* globally compiled in the trained weights.
-
-**Conclusion:**
-
-The experiment disciplines the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/) framework: the "synchronization tax" cannot be paid with generic compute. Maintaining an algorithmic channel requires structural alignment, not just gradient flow.
-
-However, the entropy regularization result fundamentally shifts our understanding of the wall. It is not a **compilation barrier** (a lack of algorithmic capability), but a **calibration barrier** caused by environmental entanglement. The model learns the universal rule, but because it lacks an endogenous mechanism to shield that rule from out-of-distribution positional noise, its epistemic confidence collapses at novel positions. The scalar entropy target acts as an exogenous, metaphorical "roof"—providing the minimal maintenance structure needed to protect the computational channel from the environment, allowing the model to confidently deploy the generalized circuit it already possesses. Whether this distinction between an unlearned algorithm and a fragile, environmentally entangled one matters for practical LLM limitations remains an open question.
+1. **Does the direction of KL divergence matter?** Forward KL (mode-covering) vs reverse KL (mode-seeking) vs Jensen-Shannon (symmetric) distillation from the same teacher.
+2. **Does genuine causal asymmetry in the data create a learnable asymmetry?** Non-invertible quadratic recurrence `x_{t+1} = x_t^2 + b mod 17` (many-to-one) vs invertible linear recurrence, forward vs backward prediction.
+3. **Can the model learn to maintain its own calibration?** Learned temperature scaling and attention positional forget-gates, trained with no external subsidy.
 
 ## Results
 
-The wall **is not intrinsic**. Two mechanisms completely eliminate it:
+Full results: [`results/RESULTS.md`](results/RESULTS.md)
+
+### Experiment 1: Distillation Direction — Null Result
+
+**The direction of KL divergence does not matter in this task.** Forward KL, reverse KL, and Jensen-Shannon distillation all erode the wall completely with identical calibration quality.
+
+| Condition | Trained MAE | Untrained MAE | Wall Ratio | D_KL at t>5 |
+|-----------|------------|---------------|------------|-------------|
+| Baseline (wall) | 0.020 | 1.649 | **84x** | 1.5-1.7 |
+| Forward KL (λ=0.5) | 0.033 | **0.001** | **0.02x** | 0.0001 |
+| Reverse KL (λ=0.5) | 0.037 | **0.001** | **0.03x** | 0.0001 |
+| Forward KL control (random teacher) | 0.027 | 2.009 | 75x | 2.2 |
+| Reverse KL control (random teacher) | 0.027 | 2.009 | 75x | 2.2 |
+
+The mode-covering vs mode-seeking distinction doesn't matter because the teacher's posterior at unrewarded positions is nearly unimodal. There is no multi-modal structure for reverse KL to collapse onto. What matters is having a *trained* teacher, not the direction of the divergence.
+
+### Experiment 2: Non-Invertible Generator — Causal Asymmetry Confirmed
+
+**The causal arrow in the data-generating process creates an irreducible informational asymmetry.**
 
 | Condition | Trained MAE | Untrained MAE | Wall Ratio |
 |-----------|------------|---------------|------------|
-| Baseline-Horizon (the wall) | 0.247 | 1.755 | **7.1x** |
-| A: Entropy regularization | 0.390 | **0.272** | **0.7x** |
-| A: Entropy control (uniform) | 0.248 | 2.092 | 8.4x |
-| B: Soft distillation | 0.225 | **0.045** | **0.2x** |
-| B: Distill control (random) | 0.185 | 2.084 | 11.3x |
+| Linear forward K=5 | 0.045 | 1.392 | 31x |
+| Linear backward K=5 | 0.082 | 1.550 | 19x |
+| Quadratic forward K=5 | 0.026 | 0.797 | 31x |
+| Quadratic backward K=5 | 0.651 | 0.730 | 1.1x |
+| **Quadratic forward K=15** | **0.009** | **—** | **—** |
+| **Quadratic backward K=15** | **0.438** | **—** | **—** |
 
-Matched controls that provide gradient flow but no task-relevant information preserve the wall, confirming the effect is driven by *information content*, not gradient flow alone.
+The cleanest result is the full-horizon (K=15) comparison, where both models receive gradient at every position:
 
-Full results: [`results/RESULTS.md`](results/RESULTS.md)
+- **Quadratic forward**: MAE=0.009, D_KL=0.0003 — near-perfect Bayesian tracking
+- **Quadratic backward**: MAE=0.438, D_KL=2-3 bits — fundamentally cannot track the posterior
 
-### Per-position MAE
+The backward model fails because the squaring map is 2-to-1: knowing `x_{t+1}` gives two possible values for `x_t`. This is an informational limit, not a computational one. No architecture can recover what the squaring destroyed.
 
-![Per-position MAE curves](figures/wall_erosion_per_position.png)
+The linear recurrence control confirms the setup: linear forward and backward both hit the wall similarly (WR 31x vs 19x), as expected for an invertible map with no genuine causal asymmetry.
 
-## Mechanisms tested
+### Experiment 3: Endogenous Roof — Negative Result
 
-| Mechanism | What it provides at unrewarded positions | Wall erosion |
-|-----------|----------------------------------------|-------------|
-| **A: Entropy reg.** | Target entropy (how uncertain to be) | Complete |
-| **B: Distillation** | Soft output distribution from trained teacher | Complete |
-| **C: Smoothness** | Hidden-state continuity constraint | None (regularization artifact) |
-| **D: Aux classifier** | Binary "is this a program?" signal | Modest |
+**The endogenous mechanisms failed to erode the wall.** They made it worse.
 
-Each mechanism has a matched control providing gradient flow with no task-relevant information.
+| Condition | Trained MAE | Untrained MAE | Wall Ratio |
+|-----------|------------|---------------|------------|
+| Baseline (no mechanism) | 0.047 | 1.462 | 31x |
+| Learned temperature | 0.033 | 1.640 | 50x |
+| Positional forget-gate | 0.037 | 1.636 | 44x |
+| Temperature + gate | 0.023 | 1.728 | 76x |
+
+The temperature head learned extreme values (T=20-40) — massively softening predictions everywhere rather than learning position-selective calibration. The gate values showed no trained/untrained differentiation (~0.3-0.6 uniformly). Without gradient signal at positions 6-15, these mechanisms have no information to calibrate against. The failure confirms that the wall is a *gradient signal* problem: endogenous architectural affordances cannot substitute for the missing supervisory signal.
 
 ## Reproducing
 
 ```bash
-# Setup
-python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Reproduce baselines (use --device mps on Apple Silicon, --device cuda on NVIDIA)
-python wall_erosion_experiment.py --mechanism none --loss_horizon 15 \
-    --n_steps 10000 --eval_every 5000 --device mps --seeds 42
-
-python wall_erosion_experiment.py --mechanism none \
-    --n_steps 10000 --eval_every 5000 --device mps --seeds 42
-
-# Train teacher (for distillation)
+# Experiment 1: Distillation direction
 python wall_erosion_experiment.py --train_teacher \
-    --n_steps 10000 --eval_every 5000 --device mps --seeds 42
+    --n_steps 150000 --device cuda --seeds 42
+python roof_experiment.py --experiment distill_direction --run_matrix \
+    --seeds 42 --device cuda --output_dir results/roof_distill
 
-# Run a mechanism
-python wall_erosion_experiment.py --mechanism entropy --subsidy_lambda 0.1 \
-    --n_steps 10000 --eval_every 5000 --device mps --seeds 42
+# Experiment 2: Causal direction
+python roof_experiment.py --experiment causal_direction --run_matrix \
+    --seeds 42 --device cuda --output_dir results/roof_causal
 
-# Run with control
-python wall_erosion_experiment.py --mechanism entropy --control --subsidy_lambda 0.1 \
-    --n_steps 10000 --eval_every 5000 --device mps --seeds 42
+# Experiment 3: Endogenous roof
+python roof_experiment.py --experiment endogenous_roof --run_matrix \
+    --seeds 42 --device cuda --output_dir results/roof_endogenous
 
-# Full matrix (all mechanisms x controls x lambda sweep x 3 seeds)
-python wall_erosion_experiment.py --run_matrix --seeds 42 43 44 --device mps
+# Generate plots
+python plot_roof_experiment.py --experiment distill_direction \
+    --results results/roof_distill/distill_direction_summary.json
+python plot_roof_experiment.py --experiment causal_direction \
+    --results results/roof_causal/causal_direction_summary.json
+python plot_roof_experiment.py --experiment endogenous_roof \
+    --results results/roof_endogenous/endogenous_summary.json
 ```
 
 ## Upstream
 
-The base task (modular linear recurrence wind tunnel) is from [vishalmisra/bayesian-wind-tunnel](https://github.com/vishalmisra/bayesian-wind-tunnel). Files `recurrence_bwt.py` and `recurrence_extrapolation.py` are from that repo and provide data generation, Bayesian ground truth computation, and evaluation.
+Extends the [wall-erosion experiment](https://github.com/riemannzeta/wall-erosion-experiment). The base task (modular linear recurrence wind tunnel) is from [vishalmisra/bayesian-wind-tunnel](https://github.com/vishalmisra/bayesian-wind-tunnel). Files `recurrence_bwt.py` and `recurrence_extrapolation.py` are from that repo.
 
 ## License
 
-This experiment code is released under the MIT License. The upstream files (`recurrence_bwt.py`, `recurrence_extrapolation.py`) are from [vishalmisra/bayesian-wind-tunnel](https://github.com/vishalmisra/bayesian-wind-tunnel) and are subject to its license terms.
+MIT License. Upstream files subject to their respective license terms.
