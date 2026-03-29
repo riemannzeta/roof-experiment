@@ -49,7 +49,8 @@ from wall_erosion_experiment import (
     _ensure_torch, _resolve_device, _seed_all,
     _build_model_class, generate_batch,
     _masked_ce_loss, _entropy_from_logits,
-    compute_distill_subsidy, compute_wall_metrics, compute_erosion_fraction,
+    compute_distill_subsidy, compute_entropy_subsidy,
+    compute_wall_metrics, compute_erosion_fraction,
 )
 from recurrence_bwt import (
     RecurrenceConfig,
@@ -781,11 +782,49 @@ def train_roof(args):
     # Pre-compute masks
     rewarded_mask = torch.zeros(
         1, train_seq_len, dtype=torch.bool, device=device)
-    rewarded_mask[0, :loss_horizon] = True
+
+    # Support non-contiguous loss positions (e.g., "1-5,13-15")
+    loss_positions_str = getattr(args, 'loss_positions', None)
+    if loss_positions_str:
+        for rng in loss_positions_str.split(','):
+            rng = rng.strip()
+            if '-' in rng:
+                lo, hi = rng.split('-')
+                # loss_positions "1-5" means positions 1..5 in 1-indexed
+                # which maps to mask positions 0..4 (0-indexed prediction positions)
+                for pos in range(int(lo) - 1, int(hi)):
+                    if 0 <= pos < train_seq_len:
+                        rewarded_mask[0, pos] = True
+            else:
+                pos = int(rng) - 1
+                if 0 <= pos < train_seq_len:
+                    rewarded_mask[0, pos] = True
+    else:
+        rewarded_mask[0, :loss_horizon] = True
 
     unrewarded_mask = torch.zeros(
         1, train_seq_len, dtype=torch.bool, device=device)
     unrewarded_mask[0, loss_horizon:train_seq_len - 1] = True
+
+    # Entropy subsidy mask (for calibration experiment)
+    entropy_mask_type = getattr(args, 'entropy_mask', 'all')
+    entropy_subsidy_mask = torch.zeros(
+        1, train_seq_len, dtype=torch.bool, device=device)
+    if entropy_mask_type == 'all':
+        entropy_subsidy_mask[0, loss_horizon:train_seq_len - 1] = True
+    elif entropy_mask_type == 'single_6':
+        if 5 < train_seq_len - 1:
+            entropy_subsidy_mask[0, 5] = True  # position 5 predicts token 6
+    elif entropy_mask_type == 'single_10':
+        if 9 < train_seq_len - 1:
+            entropy_subsidy_mask[0, 9] = True
+    elif entropy_mask_type == 'single_14':
+        if 13 < train_seq_len - 1:
+            entropy_subsidy_mask[0, 13] = True
+    elif entropy_mask_type == 'every_other':
+        for pos in [5, 7, 9, 11, 13]:  # positions predicting tokens 6,8,10,12,14
+            if pos < train_seq_len - 1:
+                entropy_subsidy_mask[0, pos] = True
 
     for step in range(1, args.n_steps + 1):
         model.train()
@@ -808,9 +847,10 @@ def train_roof(args):
         ce_mask = rew_mask[:, :-1]
         ce_loss = _masked_ce_loss(pred_logits, targets, ce_mask, n_tokens)
 
-        # Subsidy loss (distillation experiment only)
+        # Subsidy loss
         sub_loss = torch.tensor(0.0, device=device)
 
+        # Distillation experiment
         if (args.experiment == 'distill_direction'
                 and teacher is not None
                 and args.subsidy_lambda > 0):
@@ -830,6 +870,30 @@ def train_roof(args):
                 sub_loss = compute_js_distill(
                     logits[:, :-1, :], teacher_logits[:, :-1, :],
                     unrew_shifted, n_tokens, temperature=2.0)
+
+        # Calibration experiment — entropy subsidy with configurable targets and mask
+        if args.experiment == 'calibration' and args.subsidy_lambda > 0:
+            entropy_start = getattr(args, 'entropy_start_step', 0)
+            entropy_end = getattr(args, 'entropy_end_step', 999999)
+            if entropy_start <= step <= entropy_end:
+                ent_mask_shifted = entropy_subsidy_mask.expand(B, -1)[:, :-1]
+                ent_targets_shifted = entropy_targets[:, 1:]
+
+                # Apply target mode
+                target_mode = getattr(args, 'entropy_target_mode', 'correct')
+                if target_mode == 'correct':
+                    pass  # Use Bayesian targets as-is
+                elif target_mode == 'constant':
+                    c = getattr(args, 'entropy_constant', 2.08)
+                    ent_targets_shifted = torch.full_like(
+                        ent_targets_shifted, c)
+                elif target_mode == 'random':
+                    ent_targets_shifted = (
+                        torch.rand_like(ent_targets_shifted) * math.log2(p))
+
+                sub_loss = compute_entropy_subsidy(
+                    logits[:, :-1, :], ent_targets_shifted,
+                    ent_mask_shifted, n_tokens)
 
         total_loss = ce_loss + args.subsidy_lambda * sub_loss
 
@@ -897,6 +961,23 @@ def train_roof(args):
                 torch.save(
                     model.state_dict(),
                     os.path.join(args.output_dir, 'best_model.pt'))
+
+            # Periodic checkpoints for degradation tracking (Experiment 5)
+            checkpoint_every = getattr(args, 'checkpoint_every', 0)
+            if checkpoint_every > 0 and step % checkpoint_every == 0:
+                ckpt_path = os.path.join(
+                    args.output_dir, f'checkpoint_step{step}.pt')
+                torch.save(model.state_dict(), ckpt_path)
+                # Save per-position metrics at this checkpoint
+                ckpt_metrics_path = os.path.join(
+                    args.output_dir, f'metrics_step{step}.json')
+                with open(ckpt_metrics_path, 'w') as f:
+                    json.dump({
+                        'step': step,
+                        'metrics': metrics,
+                        'per_position': {str(k): v for k, v in per_pos.items()},
+                        'wall_metrics': wm,
+                    }, f, indent=2, default=float)
 
     # ====================================================================
     # Final evaluation
@@ -1179,6 +1260,131 @@ def run_endogenous_matrix(args):
     _print_summary_table(all_results)
 
 
+def run_calibration_matrix(args):
+    """Run calibration barrier experiments (3-5) for all conditions."""
+    base_output = args.output_dir
+    all_results = []
+
+    LAMBDA = 0.1  # Fixed across all calibration experiments
+
+    # --- Experiment 3: Wrong entropy targets ---
+    exp3_conditions = [
+        # (target_mode, entropy_constant, label)
+        ('correct', None, 'ent_correct'),
+        ('constant', 2.08, 'ent_const_2.08'),
+        ('constant', 1.0, 'ent_const_1.0'),
+        ('constant', 3.0, 'ent_const_3.0'),
+        ('constant', 0.5, 'ent_const_0.5'),
+        ('constant', math.log2(17), 'ent_uniform'),
+        ('random', None, 'ent_random'),
+    ]
+
+    # --- Experiment 4: Propagation ---
+    exp4_conditions = [
+        # (entropy_mask, label)
+        ('single_6', 'prop_single6'),
+        ('single_10', 'prop_single10'),
+        ('single_14', 'prop_single14'),
+        ('every_other', 'prop_every_other'),
+        ('all', 'prop_all'),
+    ]
+
+    # --- Experiment 5: Timing ---
+    exp5_conditions = [
+        # (start_step, end_step, checkpoint_every, label)
+        (0, 999999, 0, 'timing_from_start'),
+        (50000, 999999, 0, 'timing_late_50k'),
+        (100000, 999999, 0, 'timing_late_100k'),
+        (0, 50000, 10000, 'timing_remove_50k'),
+        (50000, 60000, 10000, 'timing_pulse_50k_60k'),
+    ]
+
+    for seed in args.seeds:
+        print(f"\n{'#'*70}")
+        print(f"# SEED {seed}")
+        print(f"{'#'*70}")
+
+        # Experiment 3
+        for target_mode, const_val, label in exp3_conditions:
+            cond_name = f"{label}_seed{seed}"
+            print(f"\n{'='*70}")
+            print(f"CONDITION: {cond_name}")
+            print(f"{'='*70}")
+
+            _seed_all(seed)
+            cond_args = argparse.Namespace(**vars(args))
+            cond_args.experiment = 'calibration'
+            cond_args.subsidy_lambda = LAMBDA
+            cond_args.entropy_target_mode = target_mode
+            cond_args.entropy_constant = const_val if const_val else 2.08
+            cond_args.entropy_mask = 'all'
+            cond_args.entropy_start_step = 0
+            cond_args.entropy_end_step = 999999
+            cond_args.checkpoint_every = 0
+            cond_args.output_dir = os.path.join(base_output, cond_name)
+
+            result = train_roof(cond_args)
+            result['condition'] = cond_name
+            result['seed'] = seed
+            all_results.append(result)
+
+        # Experiment 4
+        for mask_type, label in exp4_conditions:
+            cond_name = f"{label}_seed{seed}"
+            print(f"\n{'='*70}")
+            print(f"CONDITION: {cond_name}")
+            print(f"{'='*70}")
+
+            _seed_all(seed)
+            cond_args = argparse.Namespace(**vars(args))
+            cond_args.experiment = 'calibration'
+            cond_args.subsidy_lambda = LAMBDA
+            cond_args.entropy_target_mode = 'correct'
+            cond_args.entropy_constant = 2.08
+            cond_args.entropy_mask = mask_type
+            cond_args.entropy_start_step = 0
+            cond_args.entropy_end_step = 999999
+            cond_args.checkpoint_every = 0
+            cond_args.output_dir = os.path.join(base_output, cond_name)
+
+            result = train_roof(cond_args)
+            result['condition'] = cond_name
+            result['seed'] = seed
+            all_results.append(result)
+
+        # Experiment 5
+        for start, end, ckpt_every, label in exp5_conditions:
+            cond_name = f"{label}_seed{seed}"
+            print(f"\n{'='*70}")
+            print(f"CONDITION: {cond_name}")
+            print(f"{'='*70}")
+
+            _seed_all(seed)
+            cond_args = argparse.Namespace(**vars(args))
+            cond_args.experiment = 'calibration'
+            cond_args.subsidy_lambda = LAMBDA
+            cond_args.entropy_target_mode = 'correct'
+            cond_args.entropy_constant = 2.08
+            cond_args.entropy_mask = 'all'
+            cond_args.entropy_start_step = start
+            cond_args.entropy_end_step = end
+            cond_args.checkpoint_every = ckpt_every
+            cond_args.output_dir = os.path.join(base_output, cond_name)
+
+            result = train_roof(cond_args)
+            result['condition'] = cond_name
+            result['seed'] = seed
+            all_results.append(result)
+
+    # Save summary
+    summary_path = os.path.join(base_output, 'calibration_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(all_results, f, indent=2, default=float)
+    print(f"\nSummary saved to {summary_path}")
+
+    _print_summary_table(all_results)
+
+
 def _print_summary_table(all_results):
     """Print a summary table of results."""
     print(f"\n{'='*90}")
@@ -1206,7 +1412,7 @@ def main():
     # Experiment selection
     parser.add_argument('--experiment',
                         choices=['distill_direction', 'causal_direction',
-                                 'endogenous_roof'],
+                                 'endogenous_roof', 'calibration'],
                         required=True,
                         help='Which experiment to run')
     parser.add_argument('--run_matrix', action='store_true',
@@ -1224,7 +1430,28 @@ def main():
     parser.add_argument('--teacher_checkpoint', type=str, default=None,
                         help='Path to teacher model checkpoint')
 
-    # Experiment 3: endogenous roof
+    # Calibration experiment (Experiments 3-5)
+    parser.add_argument('--entropy_target_mode',
+                        choices=['correct', 'constant', 'random'],
+                        default='correct',
+                        help='How to generate entropy targets')
+    parser.add_argument('--entropy_constant', type=float, default=2.08,
+                        help='Constant entropy target value (for --entropy_target_mode constant)')
+    parser.add_argument('--entropy_mask',
+                        choices=['all', 'single_6', 'single_10', 'single_14',
+                                 'every_other'],
+                        default='all',
+                        help='Which positions receive entropy signal')
+    parser.add_argument('--entropy_start_step', type=int, default=0,
+                        help='Step at which entropy subsidy begins')
+    parser.add_argument('--entropy_end_step', type=int, default=999999,
+                        help='Step at which entropy subsidy ends')
+    parser.add_argument('--checkpoint_every', type=int, default=0,
+                        help='Save checkpoints every N steps (0=disabled)')
+    parser.add_argument('--loss_positions', type=str, default=None,
+                        help='Non-contiguous loss positions (e.g., "1-5,13-15")')
+
+    # Endogenous roof
     parser.add_argument('--endogenous',
                         choices=['none', 'temperature', 'gate', 'both'],
                         default='none',
@@ -1273,6 +1500,8 @@ def main():
             run_causal_direction_matrix(args)
         elif args.experiment == 'endogenous_roof':
             run_endogenous_matrix(args)
+        elif args.experiment == 'calibration':
+            run_calibration_matrix(args)
         return
 
     # Single condition
