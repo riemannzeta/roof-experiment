@@ -1,101 +1,119 @@
 # Roof Experiment
 
-Follow-up to the [wall-erosion experiment](https://github.com/riemannzeta/wall-erosion-experiment), testing whether KL divergence direction and causal asymmetry in the data-generating process determine how causal structure transfers in transformers.
+Follow-up to the [wall-erosion experiment](https://github.com/riemannzeta/wall-erosion-experiment), probing the entropy regularization result that a scalar signal erodes the Shannon/Kolmogorov wall completely.
 
 ## Background
 
-The wall-erosion experiment established that Misra's Shannon/Kolmogorov "wall" is a **calibration barrier**, not a compilation barrier. The transformer globally compiles the modular recurrence rule, but its confidence collapses at out-of-distribution positions. Two mechanisms erode the wall completely: distillation from a trained teacher (forward KL) and entropy regularization (a scalar calibration signal).
+The wall-erosion experiment established that Misra's Shannon/Kolmogorov "wall" can be eroded by entropy regularization — a scalar signal telling the model *how uncertain to be* at unrewarded positions, without specifying *what to predict*. This is surprising: the signal carries zero information about token identity, yet the model responds by producing correct token-level predictions.
 
-This repository tests three follow-up questions:
+An initial hypothesis, grounded in [Rigollet's mean-field theory of transformers](https://arxiv.org/abs/2512.01868), predicted that this works because attention dynamics produce global clustering of token representations. The compiled circuit would exist everywhere in the hidden states, and the entropy signal would merely fix a scalar output-layer calibration parameter (the temperature). This "calibration barrier" hypothesis generated several testable predictions.
 
-1. **Does the direction of KL divergence matter?** Forward KL (mode-covering) vs reverse KL (mode-seeking) vs Jensen-Shannon (symmetric) distillation from the same teacher.
-2. **Does genuine causal asymmetry in the data create a learnable asymmetry?** Non-invertible quadratic recurrence `x_{t+1} = x_t^2 + b mod 17` (many-to-one) vs invertible linear recurrence, forward vs backward prediction.
-3. **Can the model learn to maintain its own calibration?** Learned temperature scaling and attention positional forget-gates, trained with no external subsidy.
+**The experiments falsified the simple calibration-barrier story but revealed something more interesting**: the entropy signal doesn't fix a scale factor — it provides the gradient signal needed for the circuit to compile at each unrewarded position individually. Calibration is local, requires the correct per-position entropy targets, and degrades gradually when the signal is removed.
 
 ## Results
 
 Full results: [`results/RESULTS.md`](results/RESULTS.md)
 
-### Experiment 1: Distillation Direction — Null Result
+### Experiments 0-2: Diagnosing the Mechanism
 
-**The direction of KL divergence does not matter in this task.** Forward KL, reverse KL, and Jensen-Shannon distillation all erode the wall completely with identical calibration quality.
+Three fast diagnostic experiments tested whether the wall is a calibration failure (correct hidden states, wrong output scale) or a compilation failure (hidden states don't encode the answer at unrewarded positions).
 
-| Condition | Trained MAE | Untrained MAE | Wall Ratio | D_KL at t>5 |
-|-----------|------------|---------------|------------|-------------|
-| Baseline (wall) | 0.020 | 1.649 | **84x** | 1.5-1.7 |
-| Forward KL (λ=0.5) | 0.033 | **0.001** | **0.02x** | 0.0001 |
-| Reverse KL (λ=0.5) | 0.037 | **0.001** | **0.03x** | 0.0001 |
-| Forward KL control (random teacher) | 0.027 | 2.009 | 75x | 2.2 |
-| Reverse KL control (random teacher) | 0.027 | 2.009 | 75x | 2.2 |
+**Experiment 0 — Cosine Similarity**: Hidden states at unrewarded positions *are* in the same cluster as trained positions (cosine sim 0.65-0.76 at layer 6), and similarity *increases* with depth. Global clustering is real.
 
-The mode-covering vs mode-seeking distinction doesn't matter because the teacher's posterior at unrewarded positions is nearly unimodal. There is no multi-modal structure for reverse KL to collapse onto. What matters is having a *trained* teacher, not the direction of the divergence.
+**Experiment 1 — Temperature Sweep**: Top-1 accuracy at unrewarded positions is only **15-25%** (chance = 6%). No post-hoc temperature recovers the Bayesian posterior — D_KL remains 1.5-1.8 bits at all temperatures. **The logit ranking is wrong**, not just the scale.
 
-### Experiment 2: Non-Invertible Generator — Causal Asymmetry Confirmed
+**Experiment 2 — Linear Probing**: The decisive result. Baseline model hidden states at unrewarded positions encode the correct token at only **15-24% accuracy** (probe). The entropy-regularized model's hidden states encode it at **54%** (matching Bayesian optimal). The entropy signal reshapes the hidden representations, not just the output layer.
 
-**The causal arrow in the data-generating process creates an irreducible informational asymmetry.**
+| Position | Baseline probe acc | Entropy-reg probe acc | Baseline entropy R2 | Entropy-reg entropy R2 |
+|----------|-------------------|----------------------|---------------------|----------------------|
+| 5 [T] | 0.548 | 0.552 | 0.954 | 0.971 |
+| 6 [U] | **0.235** | **0.547** | 0.869 | 0.976 |
+| 10 [U] | **0.213** | **0.543** | 0.488 | 0.930 |
+| 15 [U] | **0.169** | **0.540** | 0.422 | 0.975 |
 
-| Condition | Trained MAE | Untrained MAE | Wall Ratio |
-|-----------|------------|---------------|------------|
-| Linear forward K=5 | 0.045 | 1.392 | 31x |
-| Linear backward K=5 | 0.082 | 1.550 | 19x |
-| Quadratic forward K=5 | 0.026 | 0.797 | 31x |
-| Quadratic backward K=5 | 0.651 | 0.730 | 1.1x |
-| **Quadratic forward K=15** | **0.009** | **—** | **—** |
-| **Quadratic backward K=15** | **0.438** | **—** | **—** |
+### Experiment 3: Wrong Entropy Targets
 
-The cleanest result is the full-horizon (K=15) comparison, where both models receive gradient at every position:
+**Only the correct per-position Bayesian entropy targets erode the wall.** Every wrong target preserves the wall, including constant 2.08 (approximately the right average value).
 
-- **Quadratic forward**: MAE=0.009, D_KL=0.0003 — near-perfect Bayesian tracking
-- **Quadratic backward**: MAE=0.438, D_KL=2-3 bits — fundamentally cannot track the posterior
+| Target | Wall Ratio | Untrained MAE |
+|--------|-----------|---------------|
+| Correct H_bayes(t) | **0.16x** | **0.006** |
+| Constant 2.08 | 32.9x | 2.044 |
+| Constant 1.0 | 42.1x | 2.097 |
+| Constant 3.0 | 48.8x | 1.995 |
+| Uniform (4.09) | 63.2x | 1.937 |
+| Random | 63.6x | 2.045 |
 
-The backward model fails because the squaring map is 2-to-1: knowing `x_{t+1}` gives two possible values for `x_t`. This is an informational limit, not a computational one. No architecture can recover what the squaring destroyed.
+The position-specific entropy values are load-bearing. The entropy regularizer is not a generic "scale anchor."
 
-The linear recurrence control confirms the setup: linear forward and backward both hit the wall similarly (WR 31x vs 19x), as expected for an invertible map with no genuine causal asymmetry.
+### Experiment 4: Signal Propagation
 
-### Experiment 3: Endogenous Roof — Negative Result
+**Calibration is purely local.** Entropy at one position improves only that position. No forward, backward, or weight-mediated propagation.
 
-**The endogenous mechanisms failed to erode the wall.** They made it worse.
+| Entropy applied at | t=6 MAE | t=7 MAE | t=10 MAE | t=14 MAE |
+|-------------------|---------|---------|----------|----------|
+| All positions | 0.003 | 0.004 | 0.004 | 0.004 |
+| Position 6 only | **0.003** | 1.684 | 1.506 | 1.526 |
+| Position 10 only | 0.407 | 0.458 | **0.005** | 1.489 |
+| Position 14 only | 1.391 | 1.742 | 1.651 | **0.006** |
+| Every-other (6,8,10,12,14) | 0.004 | 0.338 | 0.006 | 0.005 |
 
-| Condition | Trained MAE | Untrained MAE | Wall Ratio |
-|-----------|------------|---------------|------------|
-| Baseline (no mechanism) | 0.047 | 1.462 | 31x |
-| Learned temperature | 0.033 | 1.640 | 50x |
-| Positional forget-gate | 0.037 | 1.636 | 44x |
-| Temperature + gate | 0.023 | 1.728 | 76x |
+### Experiment 5: Late Introduction and Removal
 
-The temperature head learned extreme values (T=20-40) — massively softening predictions everywhere rather than learning position-selective calibration. The gate values showed no trained/untrained differentiation (~0.3-0.6 uniformly). Without gradient signal at positions 6-15, these mechanisms have no information to calibrate against. The failure confirms that the wall is a *gradient signal* problem: endogenous architectural affordances cannot substitute for the missing supervisory signal.
+**Late introduction works perfectly** — entropy signal at step 50K or 100K produces the same wall erosion as from-start. The circuit compiles at trained positions first; calibration is added later.
+
+**Removal causes slow degradation** — the maintenance interpretation is supported:
+
+```
+Step 50K (entropy removed): WR=0.07x   ← calibrated
+Step 60K:                   WR=0.57x   ← beginning to degrade
+Step 80K:                   WR=2.99x
+Step 100K:                  WR=8.86x
+Step 150K:                  WR=19.4x   ← wall mostly returned
+```
+
+**A 10K pulse temporarily calibrates but doesn't persist** (WR=0.11x at step 60K, degrades to WR=13.9x by step 150K). Calibration requires ongoing maintenance.
+
+## Interpretation
+
+The simple "calibration barrier" hypothesis — correct hidden states, wrong output temperature — is falsified. The hidden states at unrewarded positions do NOT encode the correct answer in the baseline model. But the experiments reveal a more nuanced picture:
+
+1. **Global clustering is real** (Experiment 0): hidden states at unrewarded positions occupy the same region of representation space as trained positions, and increasingly so at deeper layers.
+
+2. **The circuit doesn't compile without gradient** (Experiment 2): despite being in the right cluster, the hidden states at unrewarded positions don't carry the correct next-token prediction. Shared weight matrices and global attention aren't sufficient for the circuit to compile at positions that never receive gradient.
+
+3. **The entropy signal provides per-position compilation gradient** (Experiments 3-4): only correct, position-specific entropy targets work. The signal doesn't propagate — each position needs its own gradient. The entropy regularizer is functioning as a per-position supervisory signal that compiles the circuit locally.
+
+4. **Compilation and calibration are separable phases** (Experiment 5): the entropy signal can be introduced late (after the circuit exists at trained positions) and still works. But once established, the calibration degrades without ongoing maintenance — matching the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/) framework's prediction that synchronization costs must be continuously paid.
+
+The deepest puzzle remains: *why does a scalar entropy target suffice to compile the circuit at each position?* The entropy signal carries only ~1 number per position (how uncertain to be), yet the model recovers a full 17-class distribution. The answer appears to be that the global clustering (Step 1) provides the "direction" — the hidden state is in approximately the right neighborhood — and the entropy gradient provides the local adjustment needed to snap it into the correct configuration. The entropy signal is not just calibrating a temperature; it's providing the minimal gradient that, combined with the globally-structured hidden state, suffices to compile the circuit locally.
+
+## Earlier Experiments (Phase 1)
+
+Three earlier experiments tested KL direction, causal asymmetry, and endogenous mechanisms. These produced results explainable by simpler theories and motivated the sharper diagnostic experiments above.
+
+- **Distillation direction** (null): Forward KL = Reverse KL = JS. Direction doesn't matter when the teacher's posterior is unimodal.
+- **Non-invertible generator** (positive): Quadratic forward MAE=0.009 vs backward MAE=0.438 at full horizon. Causal asymmetry from the data-generating process is real and irreducible.
+- **Endogenous roof** (negative): Learned temperature and forget-gate worsen the wall. Architectural affordances can't substitute for missing gradient.
 
 ## Reproducing
 
 ```bash
 pip install -r requirements.txt
 
-# Experiment 1: Distillation direction
-python wall_erosion_experiment.py --train_teacher \
-    --n_steps 150000 --device cuda --seeds 42
-python roof_experiment.py --experiment distill_direction --run_matrix \
-    --seeds 42 --device cuda --output_dir results/roof_distill
+# Diagnostic experiments (fast, no training needed — requires baseline checkpoint)
+python probe_experiment.py --mode cosine_sim --checkpoint <baseline_ckpt> --device cuda
+python probe_experiment.py --mode temperature_sweep --checkpoint <baseline_ckpt> --device cuda
+python probe_experiment.py --mode probe --checkpoint <baseline_ckpt> --device cuda
 
-# Experiment 2: Causal direction
-python roof_experiment.py --experiment causal_direction --run_matrix \
-    --seeds 42 --device cuda --output_dir results/roof_causal
-
-# Experiment 3: Endogenous roof
-python roof_experiment.py --experiment endogenous_roof --run_matrix \
-    --seeds 42 --device cuda --output_dir results/roof_endogenous
-
-# Generate plots
-python plot_roof_experiment.py --experiment distill_direction \
-    --results results/roof_distill/distill_direction_summary.json
-python plot_roof_experiment.py --experiment causal_direction \
-    --results results/roof_causal/causal_direction_summary.json
-python plot_roof_experiment.py --experiment endogenous_roof \
-    --results results/roof_endogenous/endogenous_summary.json
+# Calibration experiments (Experiments 3-5)
+python roof_experiment.py --experiment calibration --run_matrix \
+    --seeds 42 --device cuda --output_dir results/roof_calibration
 ```
 
 ## Upstream
 
-Extends the [wall-erosion experiment](https://github.com/riemannzeta/wall-erosion-experiment). The base task (modular linear recurrence wind tunnel) is from [vishalmisra/bayesian-wind-tunnel](https://github.com/vishalmisra/bayesian-wind-tunnel). Files `recurrence_bwt.py` and `recurrence_extrapolation.py` are from that repo.
+Extends the [wall-erosion experiment](https://github.com/riemannzeta/wall-erosion-experiment). The base task (modular linear recurrence wind tunnel) is from [vishalmisra/bayesian-wind-tunnel](https://github.com/vishalmisra/bayesian-wind-tunnel).
 
 ## License
 

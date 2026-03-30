@@ -1,176 +1,223 @@
 # Roof Experiment Results
 
-Three experiments testing KL asymmetry, causal direction, and endogenous maintenance in Misra's modular recurrence wind tunnel.
-
 ## Setup
 
-- **Task**: Modular recurrence prediction (linear: `x_{t+1} = ax_t + b mod 17`; quadratic: `x_{t+1} = x_t^2 + b mod 17`)
-- **Model**: 6-layer transformer, 192-dim, 6 heads (~2.8M params)
+- **Task**: Modular recurrence prediction, `x_{t+1} = ax_t + b mod 17`
+- **Model**: 6-layer transformer, 192-dim, 6 heads (~2.8M params), learned PE
 - **Training**: 150K steps, batch size 64, AdamW (lr=3e-4), cosine schedule
-- **Evaluation**: Per-position MAE in bits vs Bayesian optimal, plus D_KL(P_bayes || P_model) and mode concentration
-- **Seed**: 42 (single seed; results pending for seeds 43, 44)
+- **Loss horizon**: K=5 (CE loss at positions 1-5 only, unless noted)
+- **Evaluation**: Per-position MAE in bits vs Bayesian optimal, D_KL(P_bayes || P_model), mode concentration
+- **Seed**: 42
 
 ---
 
-## Experiment 1: Distillation Direction
+## Diagnostic Experiments (0-2)
 
-Tests whether the direction of KL divergence determines what information transfers during distillation. Forward KL (mode-covering), reverse KL (mode-seeking), and Jensen-Shannon (symmetric) from the same trained teacher.
+### Experiment 0: Cosine Similarity Across the Wall
 
-### Prediction
+Cosine similarity between hidden states at position 5 (last trained) and positions 6-15 (untrained), at layers 1, 3, and 6 of the baseline (wall-intact) model.
 
-Forward KL should force the student to cover the full Bayesian posterior, including graded uncertainty. Reverse KL should allow mode collapse — correct point predictions but poor uncertainty calibration.
+| Position | Layer 0 | Layer 3 | Layer 5 |
+|----------|---------|---------|---------|
+| 4 [T] (within-trained ref) | 0.14 | 0.24 | 0.54 |
+| 6 [U] | 0.14 | 0.25 | **0.70** |
+| 7 [U] | 0.07 | 0.23 | **0.73** |
+| 10 [U] | 0.09 | 0.19 | **0.70** |
+| 13 [U] | 0.22 | 0.32 | **0.76** |
+| 15 [U] | 0.13 | 0.22 | **0.66** |
 
-### Results
-
-| Condition | Trained MAE | Untrained MAE | Wall Ratio | D_KL (t>5) | MC (t>5) |
-|-----------|------------|---------------|------------|------------|----------|
-| Baseline (no distillation) | 0.020 | 1.649 | 84x | 1.5-1.7 | 0.13-0.22 |
-| **Forward KL** (λ=0.5) | 0.033 | **0.001** | **0.02x** | **0.0001** | **0.521** |
-| **Reverse KL** (λ=0.5) | 0.037 | **0.001** | **0.03x** | **0.0001** | **0.521** |
-| Forward KL (λ=0.1) | 0.022 | 0.001 | 0.03x | 0.0001 | 0.521 |
-| Forward KL (λ=1.0) | 0.047 | 0.001 | 0.01x | 0.0001 | 0.521 |
-| Reverse KL (λ=0.1) | 0.019 | 0.001 | 0.04x | 0.0001 | 0.521 |
-| Reverse KL (λ=1.0) | 0.047 | 0.001 | 0.01x | 0.0001 | 0.521 |
-| Forward KL control (random teacher) | 0.027 | 2.009 | 75x | 2.2 | 0.14 |
-| Reverse KL control (random teacher) | 0.027 | 2.009 | 75x | 2.2 | 0.14 |
-
-### Per-position detail (Forward KL λ=0.5 vs Reverse KL λ=0.5)
-
-| Position | Fwd MAE | Rev MAE | Fwd D_KL | Rev D_KL | Fwd MC | Rev MC | H_bayes |
-|----------|---------|---------|----------|----------|--------|--------|---------|
-| 1 [T] | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.059 | 0.059 | 4.087 |
-| 3 [T] | 0.1042 | 0.1119 | 0.0024 | 0.0030 | 0.551 | 0.552 | 2.854 |
-| 5 [T] | 0.0089 | 0.0087 | 0.0005 | 0.0005 | 0.522 | 0.522 | 2.095 |
-| 6 [U] | 0.0009 | 0.0024 | 0.0002 | 0.0013 | 0.521 | 0.522 | 2.084 |
-| 7 [U] | 0.0007 | 0.0016 | 0.0001 | 0.0007 | 0.521 | 0.521 | 2.083 |
-| 8-15 [U] | 0.0007 | 0.0007 | 0.0001 | 0.0001 | 0.521 | 0.521 | 2.083 |
-
-### Interpretation
-
-**Null result.** Forward and reverse KL produce indistinguishable outcomes. Both fully erode the wall, both achieve D_KL=0.0001 at untrained positions, both track mode concentration at 0.521 (matching the Bayesian posterior). The only minor difference: reverse KL shows slightly higher MAE at positions 6-7 (0.0024 vs 0.0009) that vanishes by position 8.
-
-The prediction failed because the teacher's posterior at unrewarded positions is nearly unimodal (~0.52 probability on the correct token). Mode-covering and mode-seeking converge to the same solution when there is only one mode. The KL asymmetry claim may hold in settings with genuinely multi-modal teacher distributions, but this wind tunnel does not test that.
-
-Controls confirm the effect is real: random teachers preserve the wall identically under both directions (WR ~75x).
+**Finding**: Cosine similarity *increases* with depth and is *higher* across the wall (0.66-0.76 at layer 5) than within the trained region (0.54). Global clustering is real — the hidden states at unrewarded positions are in the same neighborhood as trained positions. Rigollet's prediction about global clustering dynamics is confirmed for inference-time representations.
 
 ---
 
-## Experiment 2: Non-Invertible Generating Process
+### Experiment 1: Post-Hoc Temperature Sweep
 
-Tests whether the statistical asymmetry created by genuine causation (non-invertible map) is detectable only in the causal direction.
+Top-1 accuracy and ranking metrics at T=1.0 (no rescaling), plus optimal T* per position.
 
-### Task design
+#### Top-1 accuracy at T=1.0
 
-- **Linear recurrence**: `x_{t+1} = ax_t + b mod 17` — invertible (a has multiplicative inverse). Forward and backward predictions are equally deterministic.
-- **Quadratic recurrence**: `x_{t+1} = x_t^2 + b mod 17` — non-invertible (squaring is 2-to-1). Forward prediction is deterministic; backward prediction has irreducible ambiguity (~1 bit per step).
+| Position | Top-1 | Mean Rank | Top-3 | Miss Margin |
+|----------|-------|-----------|-------|-------------|
+| 3 [T] | 0.523 | 5.22 | 0.572 | 2.78 |
+| 5 [T] | 0.523 | 5.09 | 0.579 | 0.10 |
+| 6 [U] | **0.249** | 6.89 | 0.379 | 1.11 |
+| 7 [U] | **0.166** | 7.76 | 0.296 | 0.29 |
+| 10 [U] | **0.165** | 7.88 | 0.284 | 0.53 |
+| 15 [U] | **0.150** | 8.08 | 0.276 | 1.30 |
 
-### Prediction
+Note: Top-1 at trained positions is ~52%, which matches the Bayesian posterior (the correct token gets ~52% probability, not 100%). The model is properly calibrated at trained positions.
 
-Linear forward ≈ linear backward (symmetry control). Quadratic forward >> quadratic backward (causal asymmetry). The full-horizon (K=15) comparison should show the backward model fails even with gradient at every position.
+#### Optimal T* per position
 
-### Results
+| Position | T* | D_KL at T* |
+|----------|-----|-----------|
+| 5 [T] | 1.0 | 0.009 |
+| 6 [U] | 1.5 | **1.481** |
+| 7 [U] | 1.0 | **1.723** |
+| 10 [U] | 1.5 | **1.680** |
+| 15 [U] | 2.0 | **1.768** |
 
-| Condition | Trained MAE | Untrained MAE | Wall Ratio |
-|-----------|------------|---------------|------------|
-| Linear forward K=5 | 0.045 | 1.392 | 31x |
-| Linear backward K=5 | 0.082 | 1.550 | 19x |
-| Quadratic forward K=5 | 0.026 | 0.797 | 31x |
-| Quadratic backward K=5 | 0.651 | 0.730 | 1.1x |
-| **Quadratic forward K=15** | **0.009** | **—** | **—** |
-| **Quadratic backward K=15** | **0.438** | **—** | **—** |
+Unrewarded T*: mean=1.6, std=0.3, range=[1.0, 2.0]
 
-### Per-position detail: Quadratic K=15 (the key comparison)
-
-| Position | Fwd MAE | Bwd MAE | Fwd D_KL | Bwd D_KL | Fwd H_model | Bwd H_model | H_bayes fwd | H_bayes bwd |
-|----------|---------|---------|----------|----------|-------------|-------------|-------------|-------------|
-| 1 | 0.0001 | 0.5485 | 0.0001 | 0.4795 | 4.087 | 3.539 | 4.087 | 4.087 |
-| 2 | 0.0849 | 1.2268 | 0.0024 | 1.0272 | 2.796 | 2.512 | 2.880 | 3.500 |
-| 3 | 0.0329 | 0.6083 | 0.0011 | 2.0460 | 2.322 | 2.297 | 2.354 | 2.844 |
-| 5 | 0.0008 | 0.4308 | 0.0002 | 3.0618 | 2.257 | 2.262 | 2.258 | 2.688 |
-| 10 | 0.0010 | 0.4055 | 0.0003 | 2.7322 | 2.257 | 2.289 | 2.256 | 2.694 |
-| 15 | 0.0010 | 0.0022 | 0.0003 | 0.0006 | 2.257 | 2.686 | 2.256 | 2.684 |
-
-### Interpretation
-
-**The causal asymmetry is confirmed.** The full-horizon comparison is the cleanest result:
-
-- **Quadratic forward** (K=15): MAE=0.009, D_KL=0.0003 — the model achieves near-perfect Bayesian tracking of the deterministic forward map.
-- **Quadratic backward** (K=15): MAE=0.438, D_KL=2-3 bits — the model fundamentally cannot track the backward posterior, even with gradient at every position. The 2-to-1 ambiguity of the squaring map creates irreducible uncertainty.
-
-The 50x MAE gap (0.009 vs 0.438) at full horizon is not a training artifact — it reflects a genuine informational asymmetry in the data-generating process. The forward map `x → x² + b` is deterministic (peaked description); the backward map requires solving `x² = c mod p`, which has 0 or 2 solutions (diffuse description). No architecture can recover what the squaring destroyed.
-
-**Controls**: Linear forward and backward both hit the wall similarly at K=5 (WR 31x vs 19x), confirming the linear recurrence has no genuine causal asymmetry (as expected for an invertible map).
-
-**Note on the backward K=5 "no wall" result** (WR=1.1x): This is a floor effect, not wall erosion. The backward model performs *poorly everywhere* (trained MAE=0.651) because the backward task is genuinely harder, so the trained/untrained gap vanishes — both are bad.
+**Finding**: The scale-factor hypothesis fails. Top-1 accuracy at unrewarded positions is 15-25% — the logit *ranking* is wrong, not just the scale. No temperature recovers the posterior (D_KL remains 1.5-1.8 at all T). The wall is not a simple temperature mismatch.
 
 ---
 
-## Experiment 3: Endogenous Roof
+### Experiment 2: Linear Probing Across Layers
 
-Tests whether architectural affordances (learned temperature scaling, attention positional forget-gate) allow the model to maintain its own calibration at unrewarded positions without external subsidy.
+Per-layer per-position linear probes trained on frozen hidden states. Compared baseline (wall-intact) vs entropy-regularized (λ=0.1) models.
 
-### Mechanisms
+#### Token prediction accuracy — Baseline vs Entropy-Regularized
 
-- **Temperature head**: MLP on hidden states outputs per-position temperature scalar, scales final logits. Model learns to sharpen (T<1) or soften (T>1) predictions per position.
-- **Positional forget-gate**: Separates content and positional streams in attention Q/K projections. Learned sigmoid gate can suppress positional information per head.
-- **Both**: Temperature + gate simultaneously.
+**Layer 5 (final):**
 
-All trained with standard K=5 loss horizon and no external subsidy.
+| Position | Baseline acc | Entropy-reg acc | Baseline entropy R2 | Entropy-reg entropy R2 |
+|----------|-------------|-----------------|--------------------|-----------------------|
+| 1 [T] | 0.050 | 0.071 | 0.000 | 0.000 |
+| 3 [T] | 0.503 | 0.524 | 0.572 | 0.115 |
+| 5 [T] | 0.548 | 0.552 | 0.954 | 0.971 |
+| 6 [U] | **0.235** | **0.547** | 0.869 | 0.976 |
+| 7 [U] | **0.147** | **0.545** | 0.713 | 0.944 |
+| 10 [U] | **0.213** | **0.543** | 0.488 | 0.930 |
+| 15 [U] | **0.169** | **0.540** | 0.422 | 0.975 |
 
-### Prediction
+#### Per-layer pattern — Entropy-regularized model token accuracy
 
-If the model can learn position-independent calibration behavior from gradient at positions 1-5, it might generalize that behavior to positions 6-15. Alternatively, without gradient signal at untrained positions, the mechanisms have no information to calibrate against.
+| Position | Layer 0 | Layer 1 | Layer 2 | Layer 3 | Layer 4 | Layer 5 |
+|----------|---------|---------|---------|---------|---------|---------|
+| 5 [T] | 0.170 | 0.309 | 0.444 | 0.504 | 0.542 | 0.552 |
+| 6 [U] | 0.167 | 0.268 | 0.435 | 0.517 | 0.541 | 0.547 |
+| 10 [U] | 0.243 | 0.321 | 0.473 | 0.529 | 0.549 | 0.543 |
+| 15 [U] | 0.241 | 0.300 | 0.461 | 0.536 | 0.540 | 0.540 |
 
-### Results
+**Finding**: The baseline model's hidden states do NOT encode the correct next token at unrewarded positions (15-24% accuracy vs 54% Bayesian optimal). The entropy-regularized model's hidden states encode it at 54% everywhere. The entropy signal reshapes the hidden representations, not just the output layer.
 
-| Condition | Trained MAE | Untrained MAE | Wall Ratio |
-|-----------|------------|---------------|------------|
-| Baseline (no mechanism) | 0.047 | 1.462 | 31x |
-| Temperature head | 0.033 | 1.640 | **50x** |
-| Positional forget-gate | 0.037 | 1.636 | **44x** |
-| Temperature + gate | 0.023 | 1.728 | **76x** |
+The entropy-regularized model shows token information emerging at layer 2-3 and reaching full accuracy by layer 4, with no trained/untrained gap. The circuit compiles uniformly across all positions when gradient is provided.
 
-### Diagnostics
-
-**Learned temperature values** (temperature head):
-```
-t= 0: T=20.56  [position 0]
-t= 1: T=25.28  [T]
-t= 2: T=2.36   [T] ← sharpened for detection boundary
-t= 3: T=10.26  [T]
-t= 4: T=10.22  [T]
-t= 5: T=11.83  [U]
-t= 6: T=18.25  [U]
-t= 7: T=16.65  [U]
-...
-t=15: T=11.91  [U]
-```
-
-The temperature head learned extreme values (T=10-40). Position 2, where the Bayesian posterior shifts most sharply, gets the lowest temperature (T=2.36, sharpening predictions). But at all other positions the temperatures are so high that predictions are massively softened, washing out any useful signal.
-
-**Gate values** (last layer, forget-gate):
-```
-t= 0: gate=0.29  t= 1: gate=0.30  t= 2: gate=0.54
-t= 3: gate=0.60  t= 4: gate=0.64  t= 5: gate=0.38
-t= 6: gate=0.32  t= 7: gate=0.30  ...
-```
-
-The gate shows some position-sensitivity — lower at positions 0-1 (where positional info is less useful) and higher at positions 3-4 (where the recurrence structure matters). But the pattern doesn't differentiate trained from untrained positions in a way that helps calibration.
-
-### Interpretation
-
-**Negative result.** The endogenous mechanisms not only fail to erode the wall — they make it *worse* (WR increases from 31x to 44-76x). The failure mode is as predicted: without gradient signal at positions 6-15, these mechanisms have no information to calibrate against. The temperature head learns to be conservative (high T = diffuse predictions) globally, which improves trained MAE slightly but degrades untrained performance. The combined model (both mechanisms) has the worst wall ratio because it has the most unconstrained degrees of freedom to overfit the trained positions.
-
-This confirms that the wall is fundamentally a **gradient signal problem**: endogenous architectural affordances cannot substitute for the missing supervisory signal at unrewarded positions.
+Interestingly, the baseline model's hidden states DO encode substantial information about the *correct entropy* (R2=0.42-0.87) even at unrewarded positions. The model "knows how uncertain it should be" but doesn't know "what to predict."
 
 ---
 
-## Cross-Experiment Summary
+## Calibration Experiments (3-5)
 
-| Experiment | Key finding | Supports framework? |
-|------------|-------------|-------------------|
-| 1: Distillation direction | Forward ≈ reverse ≈ JS — direction doesn't matter | No (null result) |
-| 2: Causal direction | Forward 50x better than backward at K=15 | Yes — causal asymmetry is real and irreducible |
-| 3: Endogenous roof | Mechanisms worsen the wall | No — confirms wall is a gradient signal problem |
+### Experiment 3: Wrong Entropy Targets
 
-The strongest result is Experiment 2's full-horizon comparison: the same architecture, same tokens, same training — only the sequence order differs — and the forward model achieves MAE=0.009 while the backward model achieves MAE=0.438. This is a direct demonstration that the data-generating process's causal arrow determines what is learnable, independent of architecture or training procedure.
+All conditions use λ=0.1, entropy applied at all unrewarded positions (6-14).
+
+| Condition | Target value | Wall Ratio | Trained MAE | Untrained MAE |
+|-----------|-------------|-----------|-------------|---------------|
+| **Correct** | H_bayes(t) ≈ 2.08 | **0.16x** | 0.036 | **0.006** |
+| Constant 2.08 | 2.08 everywhere | 32.9x | 0.062 | 2.044 |
+| Constant 1.0 | 1.0 everywhere | 42.1x | 0.050 | 2.097 |
+| Constant 3.0 | 3.0 everywhere | 48.8x | 0.041 | 1.995 |
+| Constant 0.5 | 0.5 everywhere | 63.5x | 0.034 | 2.126 |
+| Uniform (4.09) | log2(17) | 63.2x | 0.031 | 1.937 |
+| Random per-step | U(0, 4.09) | 63.6x | 0.032 | 2.045 |
+
+**Finding**: Only the correct per-position Bayesian entropy targets erode the wall. Every wrong target — including constant 2.08 (approximately the right average) — preserves the wall completely. The position-specific entropy values are load-bearing. The entropy regularizer carries real information through the gradient about how uncertain the model should be at each specific position.
+
+---
+
+### Experiment 4: Entropy Signal Propagation
+
+All conditions use λ=0.1, correct entropy targets.
+
+#### Per-position MAE by entropy mask
+
+| Position | All | Single 6 | Single 10 | Single 14 | Every-other |
+|----------|-----|----------|-----------|-----------|-------------|
+| 6 [U] | 0.003 | **0.003** | 0.407 | 1.391 | **0.004** |
+| 7 [U] | 0.004 | 1.684 | 0.458 | 1.742 | 0.338 |
+| 8 [U] | 0.004 | 1.760 | 0.487 | 1.651 | **0.007** |
+| 9 [U] | 0.005 | 1.516 | 0.770 | 1.585 | 0.805 |
+| 10 [U] | 0.004 | 1.506 | **0.005** | 1.651 | **0.006** |
+| 11 [U] | 0.004 | 1.612 | 1.554 | 1.632 | 0.121 |
+| 12 [U] | 0.004 | 1.611 | 1.555 | 1.889 | **0.005** |
+| 13 [U] | 0.004 | 1.455 | 1.570 | 1.408 | 0.167 |
+| 14 [U] | 0.004 | 1.526 | 1.489 | **0.006** | **0.005** |
+| 15 [U] | 0.004 | 1.638 | 1.543 | 1.544 | 1.268 |
+
+**Finding**: Calibration is purely local. Each targeted position achieves near-zero MAE; non-targeted positions remain at full wall. Entropy at position 6 does NOT help positions 7-15. The every-other condition is particularly clear: targeted positions (6,8,10,12,14) achieve MAE ~0.004-0.006, while interleaved positions (7,9,11,13,15) remain elevated. The signal doesn't propagate even one position.
+
+This rules out both autoregressive-flow propagation and shared-weight propagation. The entropy regularizer compiles the circuit at each specific position via direct gradient, and nowhere else.
+
+---
+
+### Experiment 5: Late Introduction and Removal
+
+All conditions use λ=0.1, correct entropy targets at all unrewarded positions.
+
+#### Final wall ratios
+
+| Condition | Schedule | Wall Ratio | Untrained MAE |
+|-----------|----------|-----------|---------------|
+| From start | Entropy 0-150K | 0.23x | 0.005 |
+| **Late 50K** | CE 0-50K, entropy 50K-150K | **0.16x** | **0.007** |
+| **Late 100K** | CE 0-100K, entropy 100K-150K | **0.16x** | **0.007** |
+| Remove 50K | Entropy 0-50K, CE 50K-150K | 21.2x | 1.010 |
+| Pulse 50K-60K | CE 0-50K, entropy 50K-60K, CE 60K-150K | 12.7x | 0.574 |
+
+#### Degradation curve — Removal condition (entropy removed at step 50K)
+
+| Step | Wall Ratio | Untrained MAE |
+|------|-----------|---------------|
+| 30K | 0.06x | 0.014 |
+| 50K (removed) | 0.07x | 0.011 |
+| 60K | 0.57x | 0.088 |
+| 70K | 1.08x | 0.131 |
+| 80K | 2.99x | 0.332 |
+| 90K | 5.26x | 0.520 |
+| 100K | 8.86x | 0.697 |
+| 120K | 13.9x | 0.797 |
+| 150K | 19.4x | 0.958 |
+
+#### Degradation curve — Pulse condition (entropy only at steps 50K-60K)
+
+| Step | Wall Ratio | Untrained MAE |
+|------|-----------|---------------|
+| 50K (pulse starts) | 10.4x | 1.594 |
+| 60K (pulse ends) | 0.11x | 0.016 |
+| 70K | 0.56x | 0.066 |
+| 80K | 0.99x | 0.103 |
+| 100K | 3.73x | 0.314 |
+| 120K | 13.3x | 0.658 |
+| 150K | 13.9x | 0.625 |
+
+**Findings**:
+
+1. **Late introduction works perfectly.** Entropy at step 50K or 100K produces the same wall erosion as from-start. The circuit compiles at trained positions first; the entropy signal calibrates unrewarded positions whenever it's introduced. This confirms the two-phase picture: compilation then calibration.
+
+2. **Removal causes slow, monotonic degradation.** The wall returns gradually over ~100K steps after entropy is removed — not a step function, not immediate collapse. This matches the "deferred maintenance" pattern: the roof doesn't cave in the day you stop fixing it, but it degrades steadily.
+
+3. **A brief pulse temporarily calibrates but doesn't persist.** 10K steps of entropy (50K-60K) dramatically calibrates the circuit (WR=0.11x at step 60K), but the calibration degrades to WR=13.9x by step 150K. Calibration is not a one-time phase transition — it requires ongoing maintenance.
+
+---
+
+## Earlier Experiments (Phase 1)
+
+### Experiment 1: Distillation Direction — Null Result
+
+Forward KL, reverse KL, and Jensen-Shannon distillation all erode the wall identically (WR 0.02-0.03x, D_KL 0.0001 at unrewarded positions). The direction doesn't matter because the teacher's posterior is unimodal.
+
+### Experiment 2: Non-Invertible Generator — Causal Asymmetry
+
+Quadratic recurrence (x_{t+1} = x_t^2 + b, many-to-one) vs linear (invertible). At full horizon (K=15), forward MAE=0.009 vs backward MAE=0.438. The causal arrow creates irreducible informational asymmetry from the data-generating process.
+
+### Experiment 3 (Phase 1): Endogenous Roof — Negative
+
+Learned temperature head and attention forget-gate worsen the wall (WR 31x → 44-76x). Without gradient at unrewarded positions, endogenous mechanisms can't self-calibrate.
+
+---
+
+## Summary
+
+| Experiment | Key finding |
+|------------|-------------|
+| 0: Cosine similarity | Global clustering is real (cos 0.66-0.76 at final layer across wall) |
+| 1: Temperature sweep | Logit ranking is wrong, not just scale (top-1 = 15-25%) |
+| 2: Probing | Baseline hidden states DON'T encode correct token at unrewarded positions; entropy-reg model DOES |
+| 3: Wrong entropy | Only correct per-position targets work — constant 2.08 fails |
+| 4: Propagation | Calibration is purely local — no propagation even one position |
+| 5: Timing | Late introduction works; removal causes slow degradation; pulse doesn't persist |
+
+The entropy regularization result is not a calibration barrier (wrong hidden states → wrong outputs) but a **compilation barrier that is overcome by minimal per-position gradient** in the context of globally-structured hidden states. The entropy signal provides ~1 scalar per position, but that scalar, combined with the correct cluster neighborhood from global attention dynamics, suffices to compile the circuit locally. Without it, the circuit exists at trained positions and nowhere else. With it, the circuit extends everywhere — but only where and while the signal is provided.
