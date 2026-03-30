@@ -4,7 +4,7 @@ Follow-up to the [wall-erosion experiment](https://github.com/riemannzeta/wall-e
 
 ## Background
 
-The wall-erosion experiment established that Misra's Shannon/Kolmogorov "wall" can be eroded by entropy regularization — a scalar signal telling the model *how uncertain to be* at unrewarded positions, without specifying *what to predict*. This is surprising: the signal carries zero information about token identity, yet the model responds by producing correct token-level predictions.
+The wall-erosion experiment established that Misra's Shannon/Kolmogorov "wall" can be eroded by entropy regularization — a per-position scalar signal telling the model *how uncertain to be* at unrewarded positions. This is surprising: the signal specifies only a single number per position (the target entropy), yet the model responds by recovering the full 17-class Bayesian posterior. However, Experiment 3 below reveals this signal is not as information-poor as it first appears — the per-sequence Bayesian entropy target implicitly carries the program/random class distinction, which is the single highest-value bit in the task.
 
 An initial hypothesis, grounded in [Rigollet's mean-field theory of transformers](https://arxiv.org/abs/2512.01868), predicted that this works because attention dynamics produce global clustering of token representations. The compiled circuit would exist everywhere in the hidden states, and the entropy signal would merely fix a scalar output-layer calibration parameter (the temperature). This "calibration barrier" hypothesis generated several testable predictions.
 
@@ -18,7 +18,7 @@ Full results: [`results/RESULTS.md`](results/RESULTS.md)
 
 Three fast diagnostic experiments tested whether the wall is a calibration failure (correct hidden states, wrong output scale) or a compilation failure (hidden states don't encode the answer at unrewarded positions).
 
-**Experiment 0 — Cosine Similarity**: Hidden states at unrewarded positions *are* in the same cluster as trained positions (cosine sim 0.65-0.76 at layer 6), and similarity *increases* with depth. Global clustering is real.
+**Experiment 0 — Cosine Similarity**: Hidden states at unrewarded positions *are* in the same cluster as trained positions (cosine sim 0.65-0.76 at the final layer), and similarity *increases* with depth. Global clustering is real.
 
 **Experiment 1 — Temperature Sweep**: Top-1 accuracy at unrewarded positions is only **15-25%** (chance = 6%). No post-hoc temperature recovers the Bayesian posterior — D_KL remains 1.5-1.8 bits at all temperatures. **The logit ranking is wrong**, not just the scale.
 
@@ -86,7 +86,11 @@ The simple "calibration barrier" hypothesis — correct hidden states, wrong out
 
 4. **Compilation and calibration are separable phases** (Experiment 5): the entropy signal can be introduced late (after the circuit exists at trained positions) and still works. But once established, the calibration degrades without ongoing maintenance — matching the [Maintaining Divergence](https://www.symmetrybroken.com/maintaining-divergence/) framework's prediction that synchronization costs must be continuously paid.
 
-The deepest puzzle remains: *why does a scalar entropy target suffice to compile the circuit at each position?* The entropy signal carries only ~1 number per position (how uncertain to be), yet the model recovers a full 17-class distribution. The answer appears to be that the global clustering (Step 1) provides the "direction" — the hidden state is in approximately the right neighborhood — and the entropy gradient provides the local adjustment needed to snap it into the correct configuration. The entropy signal is not just calibrating a temperature; it's providing the minimal gradient that, combined with the globally-structured hidden state, suffices to compile the circuit locally.
+The deepest puzzle remains: *why does a per-position entropy target suffice to compile the circuit?* The signal provides ~1 scalar per position, yet the model recovers a full 17-class distribution. Experiment 3 sharpens this: the per-sequence Bayesian entropy implicitly carries the program/random class distinction (programs get near-zero entropy, randoms get near-maximum), so the signal is richer than "one number per position" — it's one *class-dependent* number per position. Still, that's far less than the full distribution.
+
+The answer appears to involve the interaction between global structure and local gradient. Global clustering (Experiment 0) places the hidden states at unrewarded positions in the right *neighborhood* — cosine similarity 0.70 with trained positions. But the neighborhood is not the answer: the logit direction is wrong (Experiment 1, top-1 = 15-25%) and the hidden states don't encode the correct token (Experiment 2). The entropy gradient reshapes each hidden state from a partially-informative neighborhood into the correct configuration — a more substantial transformation than fixing a scale factor.
+
+Experiment 2 also reveals an asymmetry between representation and optimization: the baseline model's hidden states *do* encode the correct entropy (R2 = 0.42-0.87) at unrewarded positions, even though they don't encode the correct token. The model partially "knows" how uncertain it should be, yet this representational knowledge doesn't compile the circuit. The entropy regularizer provides *gradient* based on that same information — and that's what works. Knowing is not the same as being optimized to act on what you know.
 
 ## Earlier Experiments (Phase 1)
 

@@ -92,9 +92,9 @@ Per-layer per-position linear probes trained on frozen hidden states. Compared b
 
 **Finding**: The baseline model's hidden states do NOT encode the correct next token at unrewarded positions (15-24% accuracy vs 54% Bayesian optimal). The entropy-regularized model's hidden states encode it at 54% everywhere. The entropy signal reshapes the hidden representations, not just the output layer.
 
-The entropy-regularized model shows token information emerging at layer 2-3 and reaching full accuracy by layer 4, with no trained/untrained gap. The circuit compiles uniformly across all positions when gradient is provided.
+The per-layer table for the entropy-regularized model is particularly striking: token accuracy at unrewarded positions tracks trained positions almost identically across all layers (0.167 vs 0.170 at layer 0, 0.435 vs 0.444 at layer 2, 0.547 vs 0.552 at layer 5). The entropy signal doesn't just fix the final layer — it produces a circuit that compiles uniformly from layer 2 onward at all positions, with no trained/untrained gap at any depth.
 
-Interestingly, the baseline model's hidden states DO encode substantial information about the *correct entropy* (R2=0.42-0.87) even at unrewarded positions. The model "knows how uncertain it should be" but doesn't know "what to predict."
+Interestingly, the baseline model's hidden states DO encode substantial information about the *correct entropy* (R2=0.87 at position 6, declining to 0.42 at position 15) even at unrewarded positions, despite not encoding the correct token. The model partially "knows how uncertain it should be" but doesn't know "what to predict." This connects to Experiment 3's finding that only correct per-sequence entropy targets work: the baseline model already *represents* approximate entropy information at unrewarded positions, but this representational knowledge doesn't compile the circuit. The entropy regularizer provides *gradient* based on that same type of information — and that's what works. The distinction between knowing something (representation) and being optimized to act on it (gradient) is one of the cleaner findings of the whole experimental program.
 
 ---
 
@@ -114,7 +114,9 @@ All conditions use λ=0.1, entropy applied at all unrewarded positions (6-14).
 | Uniform (4.09) | log2(17) | 63.2x | 0.031 | 1.937 |
 | Random per-step | U(0, 4.09) | 63.6x | 0.032 | 2.045 |
 
-**Finding**: Only the correct per-position Bayesian entropy targets erode the wall. Every wrong target — including constant 2.08 (approximately the right average) — preserves the wall completely. The position-specific entropy values are load-bearing. The entropy regularizer carries real information through the gradient about how uncertain the model should be at each specific position.
+**Finding**: Only the correct per-position Bayesian entropy targets erode the wall. Every wrong target — including constant 2.08 (approximately the right average) — preserves the wall completely.
+
+The sharper finding: the *per-sequence variation* is load-bearing, not just the per-position variation. Constant 2.08 is approximately correct at every position *on average across sequences*, but it's wrong for every individual sequence. Programs (50% of data) should get near-zero entropy at positions t >= 4; randoms should get near-maximum entropy. The constant target averages these two regimes, and the average is correct — but providing the average fails completely. The entropy target implicitly carries the program/random class distinction, which is the single highest-value bit in the task. This reframes the entropy regularizer: it's not just telling the model "be this uncertain at this position" — it's telling the model "this sequence is a program" (low entropy) or "this sequence is random" (high entropy), position by position.
 
 ---
 
@@ -187,7 +189,7 @@ All conditions use λ=0.1, correct entropy targets at all unrewarded positions.
 
 1. **Late introduction works perfectly.** Entropy at step 50K or 100K produces the same wall erosion as from-start. The circuit compiles at trained positions first; the entropy signal calibrates unrewarded positions whenever it's introduced. This confirms the two-phase picture: compilation then calibration.
 
-2. **Removal causes slow, monotonic degradation.** The wall returns gradually over ~100K steps after entropy is removed — not a step function, not immediate collapse. This matches the "deferred maintenance" pattern: the roof doesn't cave in the day you stop fixing it, but it degrades steadily.
+2. **Removal causes monotonic degradation from the moment the signal stops.** The wall returns gradually over ~100K steps — WR climbs roughly linearly from 0.07x to 19.4x. This is consistent with ongoing maintenance but not specifically with Brand's *deferred* maintenance pattern (slow plateau then rapid collapse). The actual curve shows degradation beginning immediately at step 50K, with no plateau. It's more like a building that starts leaking the day you stop patching the roof, with the leak growing steadily worse — not a structure that looks fine for years then collapses suddenly.
 
 3. **A brief pulse temporarily calibrates but doesn't persist.** 10K steps of entropy (50K-60K) dramatically calibrates the circuit (WR=0.11x at step 60K), but the calibration degrades to WR=13.9x by step 150K. Calibration is not a one-time phase transition — it requires ongoing maintenance.
 
@@ -216,8 +218,10 @@ Learned temperature head and attention forget-gate worsen the wall (WR 31x → 4
 | 0: Cosine similarity | Global clustering is real (cos 0.66-0.76 at final layer across wall) |
 | 1: Temperature sweep | Logit ranking is wrong, not just scale (top-1 = 15-25%) |
 | 2: Probing | Baseline hidden states DON'T encode correct token at unrewarded positions; entropy-reg model DOES |
-| 3: Wrong entropy | Only correct per-position targets work — constant 2.08 fails |
+| 3: Wrong entropy | Only correct per-sequence targets work — constant 2.08 fails; entropy carries class identity |
 | 4: Propagation | Calibration is purely local — no propagation even one position |
-| 5: Timing | Late introduction works; removal causes slow degradation; pulse doesn't persist |
+| 5: Timing | Late introduction works; removal causes immediate monotonic degradation; pulse doesn't persist |
 
-The entropy regularization result is not a calibration barrier (wrong hidden states → wrong outputs) but a **compilation barrier that is overcome by minimal per-position gradient** in the context of globally-structured hidden states. The entropy signal provides ~1 scalar per position, but that scalar, combined with the correct cluster neighborhood from global attention dynamics, suffices to compile the circuit locally. Without it, the circuit exists at trained positions and nowhere else. With it, the circuit extends everywhere — but only where and while the signal is provided.
+The entropy regularization result is not a calibration barrier (correct hidden states, wrong output scale) but a **compilation barrier overcome by minimal per-position gradient** in the context of globally-structured hidden states. The entropy target provides one class-dependent scalar per position, which is richer than initially apparent — it implicitly carries the program/random distinction. Combined with the correct cluster neighborhood from global attention dynamics, this suffices to compile the circuit locally. Without it, the circuit exists at trained positions and nowhere else. With it, the circuit extends everywhere — but only where and while the signal is provided.
+
+The distinction between *representation* and *optimization* runs through these results: the baseline model represents approximate entropy information at unrewarded positions (Experiment 2, entropy R2 = 0.42-0.87) but cannot act on it without gradient. The entropy regularizer converts representational knowledge into optimization pressure, and that conversion is what compiles the circuit.
